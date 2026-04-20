@@ -1,0 +1,24 @@
+# Experiment outputs / artefacts
+data/
+bottleneck/data/
+bottleneck/wandb/
+bottleneck/csv_logs/
+bottleneck/results/
+bottleneck/lightning_logs/
+**/checkpoints/
+**/*.ckpt
+**/lightning_logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
