@@ -1,0 +1,29 @@
+# --- install the PyTorch trio separately (see step #2) ---
+# torch
+# torchvision
+# torchaudio
+
+# PyTorch Geometric core + ops
+torch_geometric>=2.3.0
+
+# Training utilities
+pytorch-lightning>=2.0.0
+
+# Config & type enforcement
+easydict>=1.10
+type_enforced>=0.0.4
+pyyaml>=6.0
+
+# Data and ML tools
+numpy>=1.24.0
+scikit-learn>=1.3.0
+pandas>=2.0.0
+
+# Logging & visualization
+wandb>=0.15.0
+tensorboard>=2.13.0
+
+# Jupyter & plotting
+jupyter>=1.0.0
+matplotlib>=3.7.0
+seaborn>=0.12

@@ -1,0 +1,309 @@
+Common:
+  loader_workers: 2
+  eval_every: 5
+  wd: 0.0
+  max_epochs: 100
+  val_batch_size: 1024
+  accum_grad: 2
+  dim: 1024
+  depth: 4
+  repeat: 1
+  optim_type: Adam
+  seed: 0
+  dtype: float32
+  #use_virtual_nodes: true    
+  vn_residual: true
+  #vn_assignment_strategy: "all"
+  #vn_aggregation: "sum"
+  vn_residual: true 
+  #dropout: 0.1 
+
+Task_specific:
+  SW:
+    two:
+      edgefeat_dim: 0
+      # Only specify mlp_layers once:
+      mlp_layers: 3
+      batch_size: 128
+      homog_degree_encoding: False
+      concat_self: True
+      #in_dim: 10
+      #out_dim: 100
+      dtype: float32
+      use_residual: False
+      use_layer_norm: True
+      use_activation: False      
+      mlp_activation_hidden: lrelu
+      mlp_activation_final: lrelu
+      max_epochs: 300
+      self_loop_weight: 0.5
+      lr_factor: .9
+      #num_train_samples: 7000
+      #num_test_samples: 700
+      mlp_init: ~
+      use_virtual_nodes: true    
+      vn_residual: true
+      dropout: 0.1 
+    one:
+      edgefeat_dim: 0
+      # Only specify mlp_layers once:
+      mlp_layers: 3
+      batch_size: 128
+      homog_degree_encoding: False
+      concat_self: True
+      #in_dim: 10
+      #out_dim: 100
+      dtype: float32
+      use_residual: False
+      use_layer_norm: True
+      use_activation: False      
+      mlp_activation_hidden: lrelu
+      mlp_activation_final: lrelu
+      max_epochs: 300
+      self_loop_weight: 0.5
+      lr_factor: .9
+      #num_train_samples: 7000
+      #num_test_samples: 700
+      mlp_init: ~
+      use_virtual_nodes: true    
+      vn_residual: true
+      dropout: 0.1 
+    
+  GIN:
+    two:
+      lr: 0.00007
+      batch_size: 64
+      max_epochs: 1000
+      repeat: 1
+      lr_factor: .5
+      use_residual: True
+      use_layer_norm: True
+      use_activation: True
+      num_train_samples: 7000
+      num_test_samples: 700
+    one:
+      lr: 0.0001
+      batch_size: 64
+      max_epochs: 1000
+      repeat: 1
+      lr_factor: .5
+      use_residual: True
+      use_layer_norm: True
+      use_activation: True
+      num_train_samples: 8000
+      num_test_samples: 800
+
+  GAT:
+    two:
+      batch_size: 32
+      max_epochs: 1000
+      lr: 0.0005
+      num_train_samples: 7000
+      num_test_samples: 700
+      repeat: 1
+      lr_factor: .3
+      #dim: 256
+      use_residual: True
+      heads: 2
+      use_layer_norm: True
+      use_activation: True  
+      #use_virtual_nodes: true    
+      #vn_residual: true
+    one:
+      batch_size: 24
+      max_epochs: 350
+      lr: 0.0005
+      num_train_samples: 7000
+      num_test_samples: 700
+      repeat: 1
+      lr_factor: .1
+      #dim: 256
+      use_residual: True
+      use_layer_norm: True
+      use_activation: False
+      use_virtual_nodes: true    
+      vn_residual: true 
+      dropout: 0.1  
+  GCN:            
+    two:
+      batch_size: 64
+      max_epochs: 1000
+      num_train_samples: 7000
+      num_test_samples: 700
+      repeat: 1                             
+      lr: 0.0001                   
+      lr_factor: .01
+      use_residual: True
+      use_layer_norm: True
+      use_activation: True
+    one:      
+      batch_size: 64
+      max_epochs: 200
+      repeat: 1
+      lr: 0.001           
+      use_residual: True
+      use_layer_norm: False
+      use_virtual_nodes: true    
+      vn_residual: true 
+      dropout: 0.1    
+  GGNN:
+    two:
+      batch_size: 64
+      max_epochs: 300
+      num_train_samples: 7000
+      num_test_samples: 700
+      repeat: 1                             
+      lr: 0.005                   
+      lr_factor: .5
+      #dim: 256
+      use_residual: True
+      use_activation: False
+      use_layer_norm: True
+     
+    one:
+      batch_size: 64
+      max_epochs: 200
+      num_train_samples: 10000
+      num_test_samples: 1000
+      repeat: 1          
+      lr: 0.005 
+      lr_factor: .9
+      use_layer_norm: True
+      use_residual: True
+  SAGE:
+    two:
+      batch_size: 64
+      max_epochs: 1000
+      repeat: 1
+      lr: 0.00001  
+      lr_factor: .1
+      num_train_samples: 7000
+      num_test_samples: 700
+      use_residual: True
+      use_layer_norm: True
+      use_activation: True 
+    one:  
+      batch_size: 32
+      max_epochs: 200
+      repeat: 1
+      lr: 0.001   
+      lr_factor: .3
+      use_residual: True
+      use_layer_norm: True
+      use_activation: True
+  Transformer:
+    two:
+      batch_size: 64 
+      max_epochs: 1000
+      repeat: 1
+      lr: 0.0005
+      lr_factor: 0.4
+      num_heads: 100
+      #dim: 64  
+      num_layers: 8  
+      warmup_steps: 1000
+      num_train_samples: 7000
+      num_test_samples: 700
+      use_residual: True
+      use_layer_norm: True
+      use_activation: False
+
+    one:  
+      batch_size: 128 
+      max_epochs: 800
+      repeat: 1
+      lr: 0.001
+      lr_factor: 0.1
+      num_heads: 100
+      #dim: 64  # Increased from default 64
+      num_layers: 30  # Explicitly define transformer layers
+      warmup_steps: 3000
+      use_residual: True
+      use_layer_norm: True
+      use_activation: False
+  
+  SetTransformer:
+    two:
+      batch_size: 64
+      max_epochs: 1000
+      repeat: 1
+      lr: 0.001
+      lr_factor: 0.5
+      num_heads: 4  # For set transformer attention heads
+      dropout: 0.1
+      num_train_samples: 7000
+      num_test_samples: 700
+      use_residual: True
+      use_layer_norm: True
+      use_activation: True
+
+    one:
+      batch_size: 64
+      max_epochs: 1000
+      repeat: 1
+      lr: 0.001
+      lr_factor: 0.5
+      num_heads: 4
+      dropout: 0.1
+      num_train_samples: 8000
+      num_test_samples: 800
+      use_residual: True
+      use_layer_norm: True
+      use_activation: True    
+      
+  MLP:
+    two:
+      batch_size: 64
+      max_epochs: 1000 
+      repeat: 1
+      lr: 0.00005  
+      lr_factor: 0.1
+      mlp_hidden_dim: 1024  
+      dropout: 0.3  
+      num_train_samples: 700
+      num_test_samples: 70
+      use_residual: True
+      use_layer_norm: True 
+      use_activation: True  
+  
+    one:
+      batch_size: 128
+      max_epochs: 500
+      repeat: 1
+      lr: 0.001  # Keep consistent
+      lr_factor: 0.5
+      mlp_hidden_dim: 256
+      dropout: 0.1
+      num_train_samples: 8000
+      num_test_samples: 800
+      use_residual: True
+      use_layer_norm: True
+      use_activation: True    
+      
+  Sumformer:
+    two:
+      batch_size: 64
+      max_epochs: 1000
+      repeat: 1
+      lr: 0.0001
+      lr_factor: 0.1
+      dropout: 0.1
+      num_train_samples: 6000
+      num_test_samples: 600
+      use_residual: True
+      use_layer_norm: True
+      use_activation: True
+
+    one:
+      batch_size: 64
+      max_epochs: 800
+      repeat: 1
+      lr: 0.001
+      lr_factor: 0.5
+      dim: 256
+      dropout: 0.1
+      num_train_samples: 8000
+      num_test_samples: 800
+      use_residual: True
+      use_layer_norm: True
+      use_activation: True
