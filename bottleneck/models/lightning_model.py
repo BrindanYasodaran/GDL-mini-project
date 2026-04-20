@@ -62,7 +62,7 @@ class LightningModel(pl.LightningModule):
         self.optim_type = args.optim_type  
         self.weight_decay = args.wd 
         self.task_type = args.task_type  
-        
+        self.lr_schedule = getattr(args, 'lr_schedule', 'none')
 
         self.model = model
         
@@ -101,18 +101,31 @@ class LightningModel(pl.LightningModule):
         """
         optimizer_cls = torch.optim.Adam if self.optim_type == 'Adam' else torch.optim.AdamW
         optimizer = optimizer_cls(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        
+
+        if self.lr_schedule == 'none':
+            return optimizer
+
+        if self.lr_schedule == 'plateau_val':
+            monitor_metric = 'val_acc'
+        elif self.lr_schedule == 'plateau_train':
+            monitor_metric = 'train_acc'
+        else:
+            raise ValueError(
+                f"Unknown lr_schedule {self.lr_schedule!r}. "
+                "Expected one of: 'none', 'plateau_train', 'plateau_val'."
+            )
+
         lr_scheduler = ReduceLROnPlateau(
-            optimizer, 
-            factor=self.lr_factor,  
+            optimizer,
+            factor=self.lr_factor,
             mode='max',
-            patience=2,        
+            patience=2,
         )
-        
+
         lr_scheduler_config = {
             "scheduler": lr_scheduler,
             "interval": "epoch",
-            "monitor": "train_acc",  
+            "monitor": monitor_metric,
         }
         return [optimizer], lr_scheduler_config
 

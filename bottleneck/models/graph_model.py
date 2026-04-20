@@ -34,7 +34,7 @@ class GraphModel(nn.Module):
         self.use_residual = args.use_residual
         self.use_activation = args.use_activation
         self.num_layers = args.depth
-        self.h_dim = 256 
+        self.h_dim = getattr(args, 'dim', 256)
         self.out_dim = args.out_dim
         self.in_dim = args.in_dim   
         self.task_type = args.task_type

@@ -1,10 +1,14 @@
 import argparse
+import csv
 import os
 import random
+from datetime import datetime
+from pathlib import Path
 import numpy as np
 import torch
 from easydict import EasyDict
 from pytorch_lightning import Trainer, seed_everything, callbacks
+from pytorch_lightning.loggers import WandbLogger
 from torch_geometric.loader import DataLoader
 from models.lightning_model import LightningModel, StopAtValAccCallback, CSVLogger, AccuracyPrintCallback
 from models.graph_model import GraphModelWithVirtualNode, GraphModel, GraphModelWithMultipleVirtualNodes
@@ -12,7 +16,42 @@ from models.transformer import SetTransformerModel
 from models.Sumformer import SumformerModel
 from models.MLP import MLPModel
 from utils import get_args, create_model_dir, return_datasets, compute_energy
-# from pytorch_lightning.loggers import WandbLogger  # Uncomment if using Weights & Biases
+
+
+RESULTS_CSV_COLUMNS = [
+    'timestamp', 'gnn_type', 'task_type', 'star_variant', 'n', 'K',
+    'depth', 'dim', 'lr', 'lr_schedule', 'lr_factor',
+    'batch_size', 'max_epochs', 'target_acc',
+    'use_virtual_nodes', 'num_virtual_nodes', 'vn_aggregation',
+    'num_heads', 'dropout', 'seed',
+    'test_acc', 'best_val_acc', 'epochs_run',
+    'grad_norm', 'dirichlet',
+    'num_train_samples', 'num_test_samples', 'run_name',
+]
+
+
+def _to_float(x):
+    """Coerce tensor / number / None into a plain Python float (or None)."""
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor):
+        return float(x.detach().cpu().item())
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def append_result_row(results_csv_path: str, row: dict) -> None:
+    """Append a single run's results to a CSV file; create header if new."""
+    path = Path(results_csv_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    with path.open('a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=RESULTS_CSV_COLUMNS, extrasaction='ignore')
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def worker_init_fn(seed: int):
@@ -76,10 +115,27 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
 
     model = LightningModel(args=args, task_id=task_id, model=base_model)
 
-    csv_logger = CSVLogger('csv_logs', name=f"{args.gnn_type}_{args.task_type}_{args.star_variant}_{args.n}_{K}_VN_{args.use_virtual_nodes}")
+    run_name = (
+        f"{args.gnn_type}_{args.task_type}_{args.star_variant}"
+        f"_n{args.n}_K{K}_dim{getattr(args, 'dim', 'NA')}"
+        f"_lr{getattr(args, 'lr', 'NA')}_VN{args.use_virtual_nodes}"
+        f"_h{getattr(args, 'heads', 'NA')}_seed{getattr(args, 'seed', 0)}"
+    )
+    csv_logger = CSVLogger('csv_logs', name=run_name)
 
+    loggers = [csv_logger]
+    wandb_logger = None
+    if getattr(args, 'use_wandb', False):
+        wandb_logger = WandbLogger(
+            project=getattr(args, 'wandb_project', 'short-range-oversquashing'),
+            name=run_name,
+            config=dict(args),
+            reinit=True,
+        )
+        loggers.append(wandb_logger)
 
-    stop_callback = StopAtValAccCallback(target_acc=0.92) if args.task_type == 'two' else None
+    target_acc = float(getattr(args, 'target_acc', 0.92))
+    stop_callback = StopAtValAccCallback(target_acc=target_acc) if args.task_type == 'two' else None
     callbacks_list = [callback for callback in [checkpoint_callback, stop_callback] if callback]
     print_callback = AccuracyPrintCallback()
     callbacks_list = [callback for callback in [checkpoint_callback, stop_callback, print_callback] if callback]
@@ -89,7 +145,7 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
     if num_gpus >= 2:
 
         trainer = Trainer(
-            logger=csv_logger,
+            logger=loggers,
             max_epochs=args.max_epochs,
             accelerator='gpu',
             devices=1, 
@@ -103,7 +159,7 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
         print(f"Training on 1 GPU")  
     elif num_gpus == 1:
         trainer = Trainer(
-            logger=csv_logger,
+            logger=loggers,
             max_epochs=args.max_epochs,
             accelerator='gpu',
             devices=1,
@@ -117,7 +173,7 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
     else:
 
         trainer = Trainer(
-            logger=csv_logger,
+            logger=loggers,
             max_epochs=args.max_epochs,
             accelerator='cpu',
             enable_progress_bar=True,
@@ -202,7 +258,55 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
         
     test_results = trainer.test(model, test_loader, verbose=False)
     test_accuracy = test_results[0]['test_acc'] * 100
-    
+
+    best_val_acc = None
+    if getattr(checkpoint_callback, 'best_model_score', None) is not None:
+        best_val_acc = float(checkpoint_callback.best_model_score)
+    epochs_run = int(trainer.current_epoch) + 1
+
+    grad_norm_val = _to_float(energy.get('grad_norm')) if isinstance(energy, dict) else None
+    dirichlet_val = _to_float(energy.get('dirichlet')) if isinstance(energy, dict) else None
+
+    row = {
+        'timestamp': datetime.utcnow().isoformat(timespec='seconds'),
+        'gnn_type': args.gnn_type,
+        'task_type': args.task_type,
+        'star_variant': args.star_variant,
+        'n': args.n,
+        'K': K,
+        'depth': args.depth,
+        'dim': getattr(args, 'dim', None),
+        'lr': getattr(args, 'lr', None),
+        'lr_schedule': getattr(args, 'lr_schedule', 'none'),
+        'lr_factor': getattr(args, 'lr_factor', None),
+        'batch_size': getattr(args, 'batch_size', None),
+        'max_epochs': getattr(args, 'max_epochs', None),
+        'target_acc': target_acc if args.task_type == 'two' else None,
+        'use_virtual_nodes': bool(getattr(args, 'use_virtual_nodes', False)),
+        'num_virtual_nodes': getattr(args, 'num_virtual_nodes', None),
+        'vn_aggregation': getattr(args, 'vn_aggregation', None),
+        'num_heads': getattr(args, 'num_heads', None),
+        'dropout': getattr(args, 'dropout', None),
+        'seed': getattr(args, 'seed', seed),
+        'test_acc': test_accuracy,
+        'best_val_acc': best_val_acc,
+        'epochs_run': epochs_run,
+        'grad_norm': grad_norm_val,
+        'dirichlet': dirichlet_val,
+        'num_train_samples': getattr(args, 'num_train_samples', None),
+        'num_test_samples': getattr(args, 'num_test_samples', None),
+        'run_name': run_name,
+    }
+    results_csv_path = getattr(args, 'results_csv', 'results/results.csv')
+    append_result_row(results_csv_path, row)
+    print(f"Appended run summary to {results_csv_path}")
+
+    if wandb_logger is not None:
+        try:
+            wandb_logger.experiment.finish()
+        except Exception as exc:
+            print(f"(wandb finish failed, continuing) {exc}")
+
     return test_accuracy, energy
 
 
@@ -238,8 +342,52 @@ def parse_arguments() -> argparse.Namespace:
                         help='Number of central nodes for two-radius problem (default: 1).')
     parser.add_argument('--num_heads', type=int, default=1, 
                         help='Number of attention heads for SetTransformer model.')
+    parser.add_argument('--heads', type=int, default=None,
+                        help=('Override GAT attention heads (Task_specific.GAT.<task>.heads '
+                              'in the YAML). Leave unset to use the YAML value.'))
     parser.add_argument('--dropout', type=float, default=0.1,
                         help='Dropout rate for SetTransformer model.')
+    parser.add_argument('--dim', type=int, default=None,
+                        help=('Override the hidden-feature dimension (Common.dim in the YAML). '
+                              'Leave unset to use the YAML value. Example: --dim 256.'))
+    parser.add_argument('--lr', type=float, default=None,
+                        help=('Override the learning rate (Task_specific.<model>.<task>.lr in '
+                              'the YAML). Leave unset to use the YAML value. Example: --lr 5e-4.'))
+    parser.add_argument('--max_epochs', type=int, default=None,
+                        help=('Override the maximum number of training epochs '
+                              '(Task_specific.<model>.<task>.max_epochs in the YAML). '
+                              'Leave unset to use the YAML value. Example: --max_epochs 500.'))
+    parser.add_argument('--num_train_samples', type=int, default=None,
+                        help=('Override num_train_samples (number of training graphs '
+                              'per epoch). Leave unset to use the YAML value.'))
+    parser.add_argument('--num_test_samples', type=int, default=None,
+                        help=('Override num_test_samples (size of both the test and '
+                              'val splits). Leave unset to use the YAML value.'))
+    parser.add_argument('--seed', type=int, default=0,
+                        help=('Random seed for data generation, model init, and '
+                              'DataLoader workers. Default 0 (reproduces prior runs). '
+                              'Vary this to assess seed-to-seed variance.'))
+    parser.add_argument('--lr_schedule', type=str, default='none',
+                        choices=['none', 'plateau_train', 'plateau_val'],
+                        help=('Learning-rate schedule. '
+                              '"none" (default) keeps lr constant. '
+                              '"plateau_train" is the original repo behaviour '
+                              '(ReduceLROnPlateau monitoring train_acc). '
+                              '"plateau_val" monitors val_acc instead — note that '
+                              'with eval_every>1 the effective patience is inflated, '
+                              'so set --eval_every 1 if you want patience to mean epochs.'))
+    parser.add_argument('--target_acc', type=float, default=0.92,
+                        help=('Validation-accuracy threshold for early-exit on two-radius '
+                              'runs (default 0.92 reproduces paper). Pass >1.0 (e.g. 1.01) '
+                              'to disable and train the full max_epochs.'))
+    parser.add_argument('--wandb', action='store_true', default=False,
+                        help='Log training curves (train/val/test accuracy, loss, lr) to '
+                             'Weights & Biases alongside the existing CSV logger.')
+    parser.add_argument('--wandb_project', type=str, default='short-range-oversquashing',
+                        help='W&B project name (only used when --wandb is set).')
+    parser.add_argument('--results_csv', type=str, default='results/results.csv',
+                        help='Path to a CSV file that receives one row per completed run '
+                             '(final test accuracy + metadata). Created on first write.')
     return parser.parse_args()
 
 
@@ -279,9 +427,29 @@ def main():
 
         if task_type == 'two' and args.star_variant == 'connected' and not config_args.use_virtual_nodes:
             config_args.K = args.K
-        
 
-        seed = 0
+        if args.dim is not None:
+            config_args.dim = args.dim
+        if args.lr is not None:
+            config_args.lr = args.lr
+        if args.max_epochs is not None:
+            config_args.max_epochs = args.max_epochs
+        if args.num_train_samples is not None:
+            config_args.num_train_samples = args.num_train_samples
+        if args.num_test_samples is not None:
+            config_args.num_test_samples = args.num_test_samples
+        if args.heads is not None:
+            config_args.heads = args.heads
+        config_args.lr_schedule = args.lr_schedule
+
+        config_args.target_acc = args.target_acc
+        config_args.use_wandb = args.wandb
+        config_args.wandb_project = args.wandb_project
+        config_args.results_csv = args.results_csv
+
+
+        seed = args.seed
+        config_args.seed = seed
         config_args.need_one_hot = True
         os.environ["PYTHONHASHSEED"] = str(seed)
         torch.manual_seed(seed)

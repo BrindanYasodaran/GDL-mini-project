@@ -3,7 +3,7 @@ Common:
   eval_every: 5
   wd: 0.0
   max_epochs: 100
-  val_batch_size: 1024
+  val_batch_size: 256
   accum_grad: 2
   dim: 1024
   depth: 4
@@ -104,7 +104,7 @@ Task_specific:
       lr_factor: .3
       #dim: 256
       use_residual: True
-      heads: 2
+      heads: 4
       use_layer_norm: True
       use_activation: True  
       #use_virtual_nodes: true    
