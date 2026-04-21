@@ -1,3 +1,4 @@
+import math
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 import torch
@@ -64,6 +65,14 @@ class LightningModel(pl.LightningModule):
         self.task_type = args.task_type  
         self.lr_schedule = getattr(args, 'lr_schedule', 'none')
 
+        # Probabilistic-VN temperature annealing config (used only when
+        # base_model is GraphModelWithProbabilisticVirtualNodes and thus exposes set_tau()).
+        self.prob_vn = bool(getattr(args, 'prob_vn', False))
+        self.vn_tau_schedule = str(getattr(args, 'vn_tau_schedule', 'exp'))
+        self.vn_tau_start = float(getattr(args, 'vn_tau_start', 5.0))
+        self.vn_tau_end = float(getattr(args, 'vn_tau_end', 0.1))
+        self.vn_tau_anneal_epochs = int(getattr(args, 'vn_tau_anneal_epochs', 100))
+
         self.model = model
         
         self.save_hyperparameters(ignore=['model'])
@@ -77,6 +86,26 @@ class LightningModel(pl.LightningModule):
         """Called at the start of each training epoch."""
         if self.trainer.num_devices > 1 and self.current_epoch == 0:
             print(f"[GPU {self.global_rank}] Epoch {self.current_epoch} started")
+        if self.prob_vn and hasattr(self.model, 'set_tau'):
+            tau = self._current_tau()
+            self.model.set_tau(tau)
+            self.log('vn_tau', float(tau), on_step=False, on_epoch=True)
+
+    def _current_tau(self) -> float:
+        """Compute the Gumbel-softmax temperature for the current epoch."""
+        e = int(self.current_epoch)
+        anneal = max(int(self.vn_tau_anneal_epochs), 1)
+        frac = min(e / anneal, 1.0)
+        start, end = self.vn_tau_start, self.vn_tau_end
+        if self.vn_tau_schedule == 'constant':
+            return start
+        if self.vn_tau_schedule == 'linear':
+            return start + (end - start) * frac
+        if self.vn_tau_schedule == 'exp':
+            if start <= 0 or end <= 0:
+                return start + (end - start) * frac
+            return math.exp(math.log(start) + (math.log(end) - math.log(start)) * frac)
+        return start
     
     def forward(self, X: Data) -> Tensor:
         """
@@ -151,6 +180,17 @@ class LightningModel(pl.LightningModule):
 
         self.log("train_loss", loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=labels.size(0))
         self.log("train_acc", acc, prog_bar=True, on_step=True, on_epoch=True, batch_size=labels.size(0))
+
+        if self.prob_vn:
+            ent = getattr(self.model, '_last_routing_entropy', None)
+            if ent is not None:
+                self.log("routing_entropy", ent, on_step=False, on_epoch=True,
+                         batch_size=labels.size(0))
+            top1 = getattr(self.model, '_last_mean_top1', None)
+            if top1 is not None:
+                self.log("routing_top1", top1, on_step=False, on_epoch=True,
+                         batch_size=labels.size(0))
+
         return loss
 
 

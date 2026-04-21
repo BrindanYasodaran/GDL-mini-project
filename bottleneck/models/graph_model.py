@@ -190,6 +190,142 @@ class GraphModelWithVirtualNode(GraphModel):
         return x
 
 
+class GraphModelWithProbabilisticVirtualNodes(GraphModel):
+    """
+    Graph model with **probabilistic** virtual-node rewiring.
+
+    Architecture (once per forward):
+      1. Input projection  : X        -> H_real^(0)   in (N, dim)
+      2. Router (once)     : H_real^(0) -> logits     in (N, m)
+         Gumbel top-k softmax with temperature tau gives soft assignment
+         S in (N, m); each row sums to 1 and has exactly `vn_per_node` (=k)
+         non-zero entries.
+      3. Per-layer t = 1..L, with VN table H_VN in (B, m, dim):
+         A. H_local    = GNN_layer(H_real, original_edge_index)
+         B. vn_agg     = S^T  @ H_local        (bmm over batch)
+            H_VN      <- MLP_up( H_VN + vn_agg )
+         C. H_global   = S    @ H_VN           (bmm over batch)
+            H_real'   = H_local + H_global  (+ residual / layernorm / activation)
+
+    Differs from IPR-MPNN (Qian et al. 2024):
+      - router is an MLP, not an MPNN
+      - sampling is Gumbel top-k with soft softmax (paper uses SIMPLE k-subset)
+      - no VN<->VN complete graph
+      - single sample per forward (q=1)
+      - VN init is a learnable table broadcast across graphs
+    """
+
+    def __init__(self, args: EasyDict):
+        super().__init__(args)
+
+        dtype = dtype_mapping[args.dtype]
+
+        self.num_vn = int(getattr(args, 'num_vn', 10))
+        self.vn_per_node = int(getattr(args, 'vn_per_node', 2))
+        assert 1 <= self.vn_per_node <= self.num_vn, (
+            f"vn_per_node must satisfy 1 <= d <= m; got d={self.vn_per_node}, m={self.num_vn}"
+        )
+
+        self.register_buffer('tau', torch.tensor(float(getattr(args, 'vn_tau_start', 5.0))))
+
+        self.in_lin = nn.Linear(self.in_dim, self.h_dim, dtype=dtype)
+        self.layers = nn.ModuleList([
+            get_layer(in_dim=self.h_dim, out_dim=self.h_dim, args=args)
+            for _ in range(self.num_layers)
+        ])
+
+        router_hidden = int(getattr(args, 'vn_rewire_hidden', self.h_dim))
+        self.router = nn.Sequential(
+            nn.Linear(self.h_dim, router_hidden, dtype=dtype),
+            nn.LeakyReLU(),
+            nn.Linear(router_hidden, self.num_vn, dtype=dtype),
+        )
+
+        self.vn_emb = nn.Embedding(self.num_vn, self.h_dim, dtype=dtype)
+
+        self.vn_update = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(self.h_dim),
+                nn.Linear(self.h_dim, self.h_dim, dtype=dtype),
+                nn.LeakyReLU(),
+                nn.Linear(self.h_dim, self.h_dim, dtype=dtype),
+            ) for _ in range(self.num_layers)
+        ])
+
+        self._last_routing_entropy = None
+        self._last_mean_top1 = None
+
+    def set_tau(self, tau_value: float):
+        """Mutate the Gumbel temperature (called from Lightning per-epoch hook)."""
+        self.tau.fill_(float(tau_value))
+
+    def _gumbel_topk_softmax(self, logits: torch.Tensor) -> torch.Tensor:
+        """Sparse Gumbel top-k softmax: rows sum to 1, exactly k non-zeros."""
+        k = self.vn_per_node
+        U = torch.rand_like(logits).clamp_(1e-9, 1 - 1e-9)
+        gumbel = -torch.log(-torch.log(U))
+        noisy = (logits + gumbel) / self.tau.clamp_min(1e-4)
+
+        topk_vals, topk_idx = noisy.topk(k, dim=-1)
+        masked = torch.full_like(noisy, float('-inf'))
+        masked.scatter_(1, topk_idx, topk_vals)
+        return F.softmax(masked, dim=-1)
+
+    def compute_node_embedding(self, data: Data):
+        x, edge_index = data.x, data.edge_index
+        edge_attr = getattr(data, 'edge_attr', None)
+
+        if hasattr(data, 'batch') and data.batch is not None:
+            B = int(data.batch.max().item()) + 1
+        else:
+            B = 1
+        N = x.size(0)
+        assert N % B == 0, (
+            f"GraphModelWithProbabilisticVirtualNodes requires uniform graph size; "
+            f"got N={N}, B={B} (N % B = {N % B})"
+        )
+        n_pg = N // B
+        d = self.h_dim
+        m = self.num_vn
+
+        H_real = self.in_lin(x)                                              # (N, d)
+
+        logits = self.router(H_real)                                         # (N, m)
+        S = self._gumbel_topk_softmax(logits)                                # (N, m)
+
+        with torch.no_grad():
+            eps = 1e-9
+            ent = -(S.clamp_min(eps) * S.clamp_min(eps).log()).sum(-1).mean()
+            self._last_routing_entropy = ent.detach()
+            self._last_mean_top1 = S.max(dim=-1).values.mean().detach()
+
+        S_b = S.view(B, n_pg, m)                                             # (B, n, m)
+        H_real_b = H_real.view(B, n_pg, d)                                   # (B, n, d)
+
+        H_VN = self.vn_emb.weight.unsqueeze(0).expand(B, m, d).contiguous()  # (B, m, d)
+
+        for t, (gnn_layer, vn_mlp) in enumerate(zip(self.layers, self.vn_update)):
+            H_local_flat = gnn_layer(H_real_b.reshape(N, d), edge_index, edge_attr) \
+                if edge_attr is not None else gnn_layer(H_real_b.reshape(N, d), edge_index)
+            H_local_b = H_local_flat.view(B, n_pg, d)
+
+            vn_agg = torch.bmm(S_b.transpose(1, 2), H_local_b)               # (B, m, d)
+            H_VN = vn_mlp(H_VN + vn_agg)
+
+            H_global_b = torch.bmm(S_b, H_VN)                                # (B, n, d)
+
+            H_next = H_local_b + H_global_b
+            if self.use_residual and t > 0:
+                H_next = H_next + H_real_b
+            if self.use_layer_norm:
+                H_next = self.layer_norms[t](H_next)
+            if self.use_activation:
+                H_next = F.leaky_relu(H_next)
+            H_real_b = H_next
+
+        return H_real_b.reshape(N, d)
+
+
 class GraphModelWithMultipleVirtualNodes(GraphModel):
     """
     Graph model with multiple virtual nodes.

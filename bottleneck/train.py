@@ -11,7 +11,12 @@ from pytorch_lightning import Trainer, seed_everything, callbacks
 from pytorch_lightning.loggers import WandbLogger
 from torch_geometric.loader import DataLoader
 from models.lightning_model import LightningModel, StopAtValAccCallback, CSVLogger, AccuracyPrintCallback
-from models.graph_model import GraphModelWithVirtualNode, GraphModel, GraphModelWithMultipleVirtualNodes
+from models.graph_model import (
+    GraphModelWithVirtualNode,
+    GraphModel,
+    GraphModelWithMultipleVirtualNodes,
+    GraphModelWithProbabilisticVirtualNodes,
+)
 from models.transformer import SetTransformerModel
 from models.Sumformer import SumformerModel
 from models.MLP import MLPModel
@@ -23,6 +28,8 @@ RESULTS_CSV_COLUMNS = [
     'depth', 'dim', 'lr', 'lr_schedule', 'lr_factor',
     'batch_size', 'max_epochs', 'target_acc',
     'use_virtual_nodes', 'num_virtual_nodes', 'vn_aggregation',
+    'prob_vn', 'num_vn', 'vn_per_node',
+    'vn_tau_schedule', 'vn_tau_start', 'vn_tau_end', 'vn_tau_anneal_epochs',
     'num_heads', 'dropout', 'seed',
     'test_acc', 'best_val_acc', 'epochs_run',
     'grad_norm', 'dirichlet',
@@ -102,6 +109,19 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
         base_model = MLPModel(args=args)
         print(f"Using MLP Model (ignores edges, no inter-node communication)")
         print(f"  - Hidden dim: {getattr(args, 'mlp_hidden_dim', 256)}, Layers: {args.depth}")
+    elif getattr(args, 'prob_vn', False):
+        assert not getattr(args, 'use_virtual_nodes', False), (
+            "Cannot combine --prob_vn with --use_virtual_nodes; pick one."
+        )
+        base_model = GraphModelWithProbabilisticVirtualNodes(args=args)
+        print(
+            f"Using Probabilistic Virtual Nodes | m={getattr(args,'num_vn','NA')}, "
+            f"d={getattr(args,'vn_per_node','NA')}, "
+            f"tau_sched={getattr(args,'vn_tau_schedule','exp')}, "
+            f"tau_start={getattr(args,'vn_tau_start','NA')} -> "
+            f"tau_end={getattr(args,'vn_tau_end','NA')} over "
+            f"{getattr(args,'vn_tau_anneal_epochs','NA')} epochs"
+        )
     elif args.use_virtual_nodes:
         num_vns = getattr(args, 'num_virtual_nodes', 1)
         if num_vns > 1:
@@ -115,11 +135,21 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
 
     model = LightningModel(args=args, task_id=task_id, model=base_model)
 
+    prob_vn_tag = ""
+    if getattr(args, 'prob_vn', False):
+        prob_vn_tag = (
+            f"_probVN_m{getattr(args, 'num_vn', 'NA')}"
+            f"_d{getattr(args, 'vn_per_node', 'NA')}"
+            f"_tau{getattr(args, 'vn_tau_start', 'NA')}->"
+            f"{getattr(args, 'vn_tau_end', 'NA')}"
+            f"_{getattr(args, 'vn_tau_schedule', 'exp')}"
+        )
     run_name = (
         f"{args.gnn_type}_{args.task_type}_{args.star_variant}"
         f"_n{args.n}_K{K}_dim{getattr(args, 'dim', 'NA')}"
         f"_lr{getattr(args, 'lr', 'NA')}_VN{args.use_virtual_nodes}"
         f"_h{getattr(args, 'heads', 'NA')}_seed{getattr(args, 'seed', 0)}"
+        f"{prob_vn_tag}"
     )
     csv_logger = CSVLogger('csv_logs', name=run_name)
 
@@ -229,6 +259,8 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
         base_model = SumformerModel(args=args)
     elif args.gnn_type == 'MLP':
         base_model = MLPModel(args=args)
+    elif getattr(args, 'prob_vn', False):
+        base_model = GraphModelWithProbabilisticVirtualNodes(args=args)
     elif args.use_virtual_nodes:
         num_vns = getattr(args, 'num_virtual_nodes', 1)
         if num_vns > 1:
@@ -285,6 +317,13 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
         'use_virtual_nodes': bool(getattr(args, 'use_virtual_nodes', False)),
         'num_virtual_nodes': getattr(args, 'num_virtual_nodes', None),
         'vn_aggregation': getattr(args, 'vn_aggregation', None),
+        'prob_vn': bool(getattr(args, 'prob_vn', False)),
+        'num_vn': getattr(args, 'num_vn', None),
+        'vn_per_node': getattr(args, 'vn_per_node', None),
+        'vn_tau_schedule': getattr(args, 'vn_tau_schedule', None),
+        'vn_tau_start': getattr(args, 'vn_tau_start', None),
+        'vn_tau_end': getattr(args, 'vn_tau_end', None),
+        'vn_tau_anneal_epochs': getattr(args, 'vn_tau_anneal_epochs', None),
         'num_heads': getattr(args, 'num_heads', None),
         'dropout': getattr(args, 'dropout', None),
         'seed': getattr(args, 'seed', seed),
@@ -335,9 +374,36 @@ def parse_arguments() -> argparse.Namespace:
                         help='Disable virtual nodes.')
     parser.add_argument('--num_virtual_nodes', type=int, default=None, 
                         help='Number of virtual nodes to use (default: use config file).')
+    parser.add_argument('--use_residual', dest='use_residual', action='store_true',
+                        default=None,
+                        help='Enable backbone MPNN residual (input→output skip per layer). '
+                             'Overrides the YAML. Default: use YAML value.')
+    parser.add_argument('--no_residual', dest='use_residual', action='store_false',
+                        help='Disable backbone MPNN residual. Overrides the YAML.')
     parser.add_argument('--vn_aggregation', type=str, default=None,
                         choices=['sum', 'mean'],
                         help='Aggregation method for multiple virtual nodes (default: sum).')
+    # Probabilistic Virtual Nodes (IPR-MPNN-style, simplified)
+    parser.add_argument('--prob_vn', action='store_true', default=False,
+                        help='Enable probabilistic VN rewiring (Gumbel top-k soft '
+                             'routing + per-layer VN update). Cannot be combined '
+                             'with --use_virtual_nodes.')
+    parser.add_argument('--num_vn', type=int, default=None,
+                        help='Number of virtual nodes m for --prob_vn (default from YAML: 10).')
+    parser.add_argument('--vn_per_node', type=int, default=None,
+                        help='Connections-per-node d for --prob_vn; must satisfy d <= m '
+                             '(default from YAML: 2).')
+    parser.add_argument('--vn_tau_schedule', type=str, default=None,
+                        choices=['constant', 'linear', 'exp'],
+                        help='Gumbel temperature schedule for --prob_vn '
+                             '(default from YAML: exp).')
+    parser.add_argument('--vn_tau_start', type=float, default=None,
+                        help='Initial Gumbel temperature tau at epoch 0 (default 5.0).')
+    parser.add_argument('--vn_tau_end', type=float, default=None,
+                        help='Final Gumbel temperature tau after annealing (default 0.1).')
+    parser.add_argument('--vn_tau_anneal_epochs', type=int, default=None,
+                        help='Number of epochs over which tau anneals from start to end '
+                             '(default 100). Epochs beyond this are pinned at vn_tau_end.')
     parser.add_argument('--K', type=int, default=1, 
                         help='Number of central nodes for two-radius problem (default: 1).')
     parser.add_argument('--num_heads', type=int, default=1, 
@@ -444,9 +510,29 @@ def main():
             config_args.num_test_samples = args.num_test_samples
         if args.heads is not None:
             config_args.heads = args.heads
+        if args.use_residual is not None:
+            config_args.use_residual = args.use_residual
         config_args.lr_schedule = args.lr_schedule
         if args.lr_factor is not None:
             config_args.lr_factor = args.lr_factor
+
+        # Probabilistic virtual nodes
+        config_args.prob_vn = bool(args.prob_vn)
+        if args.prob_vn:
+            # Ensure the base VN code path is never picked alongside prob_vn.
+            config_args.use_virtual_nodes = False
+        if args.num_vn is not None:
+            config_args.num_vn = args.num_vn
+        if args.vn_per_node is not None:
+            config_args.vn_per_node = args.vn_per_node
+        if args.vn_tau_schedule is not None:
+            config_args.vn_tau_schedule = args.vn_tau_schedule
+        if args.vn_tau_start is not None:
+            config_args.vn_tau_start = args.vn_tau_start
+        if args.vn_tau_end is not None:
+            config_args.vn_tau_end = args.vn_tau_end
+        if args.vn_tau_anneal_epochs is not None:
+            config_args.vn_tau_anneal_epochs = args.vn_tau_anneal_epochs
 
         config_args.target_acc = args.target_acc
         config_args.use_wandb = args.wandb
