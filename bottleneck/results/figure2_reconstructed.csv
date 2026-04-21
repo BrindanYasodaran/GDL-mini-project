@@ -1,0 +1,9 @@
+run_name,model,lr,dim,seed,last_epoch,best_val_acc,best_epoch,first_epoch_ge_0.92
+GAT_two_connected_n100_K1_dim1024_lr0.0001_VNFalse_h4_seed1,GAT,0.0001,1024,1,114,0.9426,114,114.0
+GAT_two_connected_n100_K1_dim1024_lr0.0001_VNFalse_h4_seed2,GAT,0.0001,1024,2,104,0.9365,104,104.0
+GAT_two_connected_n100_K1_dim1024_lr0.0002_VNFalse_h4_seed1,GAT,0.0002,1024,1,54,0.9273,54,54.0
+GAT_two_connected_n100_K1_dim1024_lr0.0002_VNFalse_h4_seed2,GAT,0.0002,1024,2,69,0.9485,69,69.0
+GAT_two_connected_n100_K1_dim1024_lr5e-05_VNFalse_h4_seed1,GAT,5e-05,1024,1,149,0.9037,144,
+GAT_two_connected_n100_K1_dim1024_lr5e-05_VNFalse_h4_seed2,GAT,5e-05,1024,2,149,0.8762,149,
+GAT_two_connected_n100_K1_dim1024_lr5e-05_VNFalse_h4_seed3,GAT,5e-05,1024,3,41,0.2969,39,
+SetTransformer_two_connected_n100_K1_dim32_lr0.001_VNFalse,SetTransformer,0.001,32,,25,1.0000,24,19.0
