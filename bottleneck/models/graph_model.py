@@ -149,6 +149,7 @@ class GraphModelWithVirtualNode(GraphModel):
             )
         
         for i, layer in enumerate(self.layers):
+            x_input = x
             if hasattr(layer, '__call__'):
                 if edge_index.size(1) > 0: 
                     x = layer(x, edge_index)
@@ -159,7 +160,10 @@ class GraphModelWithVirtualNode(GraphModel):
                         x = layer.linear(x)
                     else:
                         x = layer(x, edge_index)
-            
+
+            if self.use_residual and i > 0:
+                x = x + x_input
+
             if self.use_virtual_nodes:
                 x = x + vn_emb[batch_tensor]
             

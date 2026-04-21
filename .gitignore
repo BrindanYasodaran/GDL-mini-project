@@ -8,6 +8,7 @@ bottleneck/lightning_logs/
 **/checkpoints/
 **/*.ckpt
 **/lightning_logs/
+**/*.log
 
 # Python
 __pycache__/

@@ -40,7 +40,12 @@ def get_layer(args: EasyDict, in_dim: int, out_dim: int):
             concat=False  
         ),
         'SAGE': lambda: SAGEConv(in_channels=in_dim, out_channels=out_dim, aggr='sum'),
-        'Transformer': lambda: TransformerConv(in_channels=in_dim, out_channels=out_dim)
+        'Transformer': lambda: TransformerConv(
+            in_channels=in_dim,
+            out_channels=out_dim,
+            heads=getattr(args, 'heads', 1),
+            concat=False,
+        ),
     }
     
 

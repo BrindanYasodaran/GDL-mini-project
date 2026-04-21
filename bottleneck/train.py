@@ -376,6 +376,10 @@ def parse_arguments() -> argparse.Namespace:
                               '"plateau_val" monitors val_acc instead — note that '
                               'with eval_every>1 the effective patience is inflated, '
                               'so set --eval_every 1 if you want patience to mean epochs.'))
+    parser.add_argument('--lr_factor', type=float, default=None,
+                        help=('Override lr_factor used by ReduceLROnPlateau '
+                              '(multiplicative LR decay on plateau). Paper uses '
+                              '0.1 for GCN. Only applies when --lr_schedule != none.'))
     parser.add_argument('--target_acc', type=float, default=0.92,
                         help=('Validation-accuracy threshold for early-exit on two-radius '
                               'runs (default 0.92 reproduces paper). Pass >1.0 (e.g. 1.01) '
@@ -441,6 +445,8 @@ def main():
         if args.heads is not None:
             config_args.heads = args.heads
         config_args.lr_schedule = args.lr_schedule
+        if args.lr_factor is not None:
+            config_args.lr_factor = args.lr_factor
 
         config_args.target_acc = args.target_acc
         config_args.use_wandb = args.wandb

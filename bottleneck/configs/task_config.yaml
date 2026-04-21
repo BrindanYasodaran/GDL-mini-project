@@ -132,7 +132,7 @@ Task_specific:
       num_test_samples: 700
       repeat: 1                             
       lr: 0.0001                   
-      lr_factor: .01
+      lr_factor: 0.1
       use_residual: True
       use_layer_norm: True
       use_activation: True
@@ -191,36 +191,31 @@ Task_specific:
       use_residual: True
       use_layer_norm: True
       use_activation: True
+  # TransformerConv (K/Q/V attention on graph edges) via PyG's torch_geometric.nn.TransformerConv.
+  # Layer depth comes from Common.depth (=4). Heads come from --heads CLI flag (default 1 in get_layer).
+  # Matches the wrapper stack (residual / LayerNorm / LeakyReLU) used for GAT for a fair comparison.
   Transformer:
     two:
-      batch_size: 64 
+      batch_size: 64
       max_epochs: 1000
       repeat: 1
-      lr: 0.0005
-      lr_factor: 0.4
-      num_heads: 100
-      #dim: 64  
-      num_layers: 8  
-      warmup_steps: 1000
+      lr: 0.0001                 # paper-style value for dim=1024; override via --lr
+      lr_factor: 0.1             # only used when --lr_schedule != none
       num_train_samples: 7000
       num_test_samples: 700
       use_residual: True
       use_layer_norm: True
-      use_activation: False
+      use_activation: True       # align with GAT/GCN in this codebase
 
-    one:  
-      batch_size: 128 
+    one:
+      batch_size: 128
       max_epochs: 800
       repeat: 1
-      lr: 0.001
+      lr: 0.0001
       lr_factor: 0.1
-      num_heads: 100
-      #dim: 64  # Increased from default 64
-      num_layers: 30  # Explicitly define transformer layers
-      warmup_steps: 3000
       use_residual: True
       use_layer_norm: True
-      use_activation: False
+      use_activation: True
   
   SetTransformer:
     two:
