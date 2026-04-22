@@ -7,6 +7,10 @@ from pathlib import Path
 import numpy as np
 import torch
 from easydict import EasyDict
+# PyTorch 2.6+ defaults torch.load(weights_only=True), which blocks EasyDict
+# (stored in the checkpoint's saved hyperparameters). Allowlist it so
+# LightningModel.load_from_checkpoint(...) works when reloading the best ckpt.
+torch.serialization.add_safe_globals([EasyDict])
 from pytorch_lightning import Trainer, seed_everything, callbacks
 from pytorch_lightning.loggers import WandbLogger
 from torch_geometric.loader import DataLoader
@@ -28,7 +32,8 @@ RESULTS_CSV_COLUMNS = [
     'depth', 'dim', 'lr', 'lr_schedule', 'lr_factor',
     'batch_size', 'max_epochs', 'target_acc',
     'use_virtual_nodes', 'num_virtual_nodes', 'vn_aggregation',
-    'prob_vn', 'num_vn', 'vn_per_node',
+    'prob_vn', 'num_vn', 'vn_per_node', 'oracle_routing', 'oracle_route_centers',
+    'vn_ste', 'vn_router',
     'vn_tau_schedule', 'vn_tau_start', 'vn_tau_end', 'vn_tau_anneal_epochs',
     'num_heads', 'dropout', 'seed',
     'test_acc', 'best_val_acc', 'epochs_run',
@@ -89,12 +94,21 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
     (X_train, X_test, X_val), K = return_datasets(args=args)
     
     model_dir, path_to_project = create_model_dir(args, task_specific)
+
+    if os.path.isdir(model_dir):
+        for _fn in os.listdir(model_dir):
+            if _fn.endswith('.ckpt'):
+                try:
+                    os.remove(os.path.join(model_dir, _fn))
+                except OSError:
+                    pass
+
     checkpoint_callback = callbacks.ModelCheckpoint(
         dirpath=model_dir,
         filename='{epoch}-{val_acc:.5f}' + f'K_{K}',
         save_top_k=1,
         monitor='val_acc',
-        save_last=True,
+        save_last=False,
         mode='max'
     )
 
@@ -114,14 +128,27 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
             "Cannot combine --prob_vn with --use_virtual_nodes; pick one."
         )
         base_model = GraphModelWithProbabilisticVirtualNodes(args=args)
-        print(
-            f"Using Probabilistic Virtual Nodes | m={getattr(args,'num_vn','NA')}, "
-            f"d={getattr(args,'vn_per_node','NA')}, "
-            f"tau_sched={getattr(args,'vn_tau_schedule','exp')}, "
-            f"tau_start={getattr(args,'vn_tau_start','NA')} -> "
-            f"tau_end={getattr(args,'vn_tau_end','NA')} over "
-            f"{getattr(args,'vn_tau_anneal_epochs','NA')} epochs"
-        )
+        if getattr(args, 'oracle_routing', False):
+            centers_str = (
+                "centers routed via id mod m" if getattr(args, 'oracle_route_centers', False)
+                else "centers excluded (zero rows)"
+            )
+            print(
+                f"Using ORACLE-routed Virtual Nodes | m={getattr(args,'num_vn','NA')} "
+                f"(router + Gumbel bypassed; S fixed from identifiers; {centers_str})"
+            )
+        else:
+            mode = "STE (hard forward / soft backward)" if getattr(args, 'vn_ste', False) else "dense soft"
+            router = getattr(args, 'vn_router', 'mlp')
+            print(
+                f"Using Probabilistic Virtual Nodes [{mode}, router={router}] | "
+                f"m={getattr(args,'num_vn','NA')}, "
+                f"d={getattr(args,'vn_per_node','NA')}, "
+                f"tau_sched={getattr(args,'vn_tau_schedule','exp')}, "
+                f"tau_start={getattr(args,'vn_tau_start','NA')} -> "
+                f"tau_end={getattr(args,'vn_tau_end','NA')} over "
+                f"{getattr(args,'vn_tau_anneal_epochs','NA')} epochs"
+            )
     elif args.use_virtual_nodes:
         num_vns = getattr(args, 'num_virtual_nodes', 1)
         if num_vns > 1:
@@ -137,13 +164,24 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
 
     prob_vn_tag = ""
     if getattr(args, 'prob_vn', False):
-        prob_vn_tag = (
-            f"_probVN_m{getattr(args, 'num_vn', 'NA')}"
-            f"_d{getattr(args, 'vn_per_node', 'NA')}"
-            f"_tau{getattr(args, 'vn_tau_start', 'NA')}->"
-            f"{getattr(args, 'vn_tau_end', 'NA')}"
-            f"_{getattr(args, 'vn_tau_schedule', 'exp')}"
-        )
+        if getattr(args, 'oracle_routing', False):
+            centers_suffix = (
+                "_withC" if getattr(args, 'oracle_route_centers', False) else ""
+            )
+            prob_vn_tag = (
+                f"_probVN_ORACLE_m{getattr(args, 'num_vn', 'NA')}{centers_suffix}"
+            )
+        else:
+            ste_suffix = "_STE" if getattr(args, 'vn_ste', False) else ""
+            router_suffix = f"_r{getattr(args, 'vn_router', 'mlp')}"
+            prob_vn_tag = (
+                f"_probVN{ste_suffix}{router_suffix}"
+                f"_m{getattr(args, 'num_vn', 'NA')}"
+                f"_d{getattr(args, 'vn_per_node', 'NA')}"
+                f"_tau{getattr(args, 'vn_tau_start', 'NA')}->"
+                f"{getattr(args, 'vn_tau_end', 'NA')}"
+                f"_{getattr(args, 'vn_tau_schedule', 'exp')}"
+            )
     run_name = (
         f"{args.gnn_type}_{args.task_type}_{args.star_variant}"
         f"_n{args.n}_K{K}_dim{getattr(args, 'dim', 'NA')}"
@@ -320,6 +358,10 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
         'prob_vn': bool(getattr(args, 'prob_vn', False)),
         'num_vn': getattr(args, 'num_vn', None),
         'vn_per_node': getattr(args, 'vn_per_node', None),
+        'oracle_routing': bool(getattr(args, 'oracle_routing', False)),
+        'oracle_route_centers': bool(getattr(args, 'oracle_route_centers', False)),
+        'vn_ste': bool(getattr(args, 'vn_ste', False)),
+        'vn_router': getattr(args, 'vn_router', 'mlp'),
         'vn_tau_schedule': getattr(args, 'vn_tau_schedule', None),
         'vn_tau_start': getattr(args, 'vn_tau_start', None),
         'vn_tau_end': getattr(args, 'vn_tau_end', None),
@@ -404,6 +446,34 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--vn_tau_anneal_epochs', type=int, default=None,
                         help='Number of epochs over which tau anneals from start to end '
                              '(default 100). Epochs beyond this are pinned at vn_tau_end.')
+    parser.add_argument('--oracle_routing', action='store_true', default=False,
+                        help='With --prob_vn, bypass the router MLP and Gumbel sampling '
+                             'and build a hand-crafted hard routing S directly from node '
+                             'identifiers so every source shares a VN with its matching '
+                             'target (id mod num_vn). Centers get zero rows by default. '
+                             'Isolates the VN mechanism from routing-learning.')
+    parser.add_argument('--oracle_route_centers', action='store_true', default=False,
+                        help='With --oracle_routing, also route centers via `id mod m` '
+                             '(matching what a learned id-keyed router would do). Default: '
+                             'centers have zero rows (clean source/target VN channel).')
+    parser.add_argument('--vn_ste', action='store_true', default=False,
+                        help='Use straight-through Gumbel-softmax for routing: forward '
+                             'pass uses hard top-k one-hot S (discriminative VN pathway '
+                             'from epoch 0, matches oracle forward); backward pass uses '
+                             'dense soft gradient. Fixes the "uniform S -> info-free '
+                             'pathway -> dead router" failure mode of dense soft routing.')
+    parser.add_argument('--vn_router', type=str, default=None,
+                        choices=['mlp', 'dot', 'simple'],
+                        help='Router logit function for --prob_vn. '
+                             '"mlp" (default): 2-layer MLP on H_real. '
+                             '"dot": Perceiver/ISA-style router that projects raw x '
+                             'and dots against vn_emb; preserves input similarity '
+                             'so source/target with shared id-bits naturally route '
+                             'to the same VN from epoch 0. '
+                             '"simple": minimal router - orthogonal anchors directly '
+                             'in input space, plain softmax, no Gumbel/STE/annealing. '
+                             'Use with small fixed tau (e.g. 0.1) and a constant '
+                             'schedule. Ignores --vn_per_node and --vn_ste.')
     parser.add_argument('--K', type=int, default=1, 
                         help='Number of central nodes for two-radius problem (default: 1).')
     parser.add_argument('--num_heads', type=int, default=1, 
@@ -533,6 +603,30 @@ def main():
             config_args.vn_tau_end = args.vn_tau_end
         if args.vn_tau_anneal_epochs is not None:
             config_args.vn_tau_anneal_epochs = args.vn_tau_anneal_epochs
+        config_args.oracle_routing = bool(args.oracle_routing)
+        config_args.oracle_route_centers = bool(args.oracle_route_centers)
+        config_args.vn_ste = bool(args.vn_ste)
+        if args.vn_router is not None:
+            config_args.vn_router = args.vn_router
+        if args.oracle_routing and not args.prob_vn:
+            raise ValueError(
+                "--oracle_routing requires --prob_vn; it replaces the learned router "
+                "inside the probabilistic VN model."
+            )
+        if args.oracle_route_centers and not args.oracle_routing:
+            raise ValueError(
+                "--oracle_route_centers requires --oracle_routing."
+            )
+        if args.vn_ste and not args.prob_vn:
+            raise ValueError(
+                "--vn_ste requires --prob_vn; it modifies the routing function "
+                "inside the probabilistic VN model."
+            )
+        if args.vn_ste and args.oracle_routing:
+            raise ValueError(
+                "--vn_ste and --oracle_routing are mutually exclusive: oracle routing "
+                "already uses a hard hand-crafted S."
+            )
 
         config_args.target_acc = args.target_acc
         config_args.use_wandb = args.wandb
