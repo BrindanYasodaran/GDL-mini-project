@@ -238,31 +238,38 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
         #                      id-keyed router would do.
         self.oracle_route_centers = bool(getattr(args, 'oracle_route_centers', False))
 
-        # Straight-through estimator: forward pass uses hard top-k one-hot routing
-        # (discriminative VN pathway from epoch 0, matches the oracle's forward),
-        # backward pass uses dense soft Gumbel-softmax gradient (all logits learn).
-        # Fixes the "uniform S => information-free VN pathway => dead router" failure
-        # mode observed with dense soft routing.
-        self.vn_ste = bool(getattr(args, 'vn_ste', False))
-
-        # Router logit function:
-        #   'mlp'    (original): logits_i = MLP(H_real_i). Two-layer MLP with
-        #            LeakyReLU. Blind projection; fails on two-radius because the
-        #            MLP scrambles the natural similarity between source_i and
-        #            target_i's raw features, so they route differently.
-        #   'dot'    (Solution 1): logits = (W x) @ vn_emb^T / sqrt(h). Learnable
-        #            projection W + attention against shared vn_emb anchors.
-        #   'simple' (Solution 1 minimal): logits = x @ vn_anchors^T, with
-        #            vn_anchors living in raw INPUT space (no projection) and
-        #            initialized as orthogonal unit rows. Separate anchor table
-        #            from vn_emb (which stays in hidden space for VN states).
-        #            No Gumbel, no STE, no annealing — plain softmax at a fixed
-        #            small tau. Should work if orthogonal anchors + sharp softmax
-        #            give enough rendezvous at init.
-        self.vn_router_type = str(getattr(args, 'vn_router', 'mlp')).lower()
-        assert self.vn_router_type in ('mlp', 'dot', 'simple'), (
-            f"vn_router must be 'mlp', 'dot', or 'simple'; got {self.vn_router_type!r}"
+        # Router logit function. All three use plain temperature-softmax (no
+        # Gumbel noise, no STE, no top-k sparsification). They differ only in
+        # (a) parameter sharing and (b) when routing is computed:
+        #
+        #   'decoupled': dedicated routing subspace of dim d_router (e.g. 64).
+        #     logits = router_proj(x) @ vn_anchors.T
+        #       router_proj:  (d_router, in_dim)  — separate from in_lin
+        #       vn_anchors:   (m, d_router)       — separate from vn_emb
+        #     Fully decoupled from the GNN hidden space and from vn_emb. The
+        #     routing subspace can specialize purely for cluster assignment.
+        #     Routing is computed ONCE, before the layer loop.
+        #
+        #   'simple': fully shared parameters in GNN hidden space.
+        #     logits = in_lin(x) @ vn_emb.T / sqrt(h_dim)
+        #       No router_proj, no vn_anchors. in_lin does double duty as both
+        #       the GNN input projection and the real-side routing query;
+        #       vn_emb does double duty as both initial VN state and routing
+        #       anchor table. Routing is computed ONCE, before the layer loop.
+        #
+        #   'dynamic': same shared-param setup as 'simple', but routing is
+        #     recomputed inside the layer loop at every layer t using the
+        #     CURRENT real-side state H_real_b (evolving) and the CURRENT VN
+        #     state H_VN (evolving). At t=0 this equals 'simple' exactly;
+        #     later layers let the router adapt as representations drift.
+        self.vn_router_type = str(getattr(args, 'vn_router', 'simple')).lower()
+        assert self.vn_router_type in ('decoupled', 'simple', 'dynamic'), (
+            f"vn_router must be 'decoupled', 'simple', or 'dynamic'; "
+            f"got {self.vn_router_type!r}"
         )
+
+        # Router subspace dimension (used only by 'decoupled').
+        self.vn_d_router = int(getattr(args, 'vn_d_router', 64))
 
         self.register_buffer('tau', torch.tensor(float(getattr(args, 'vn_tau_start', 5.0))))
 
@@ -272,38 +279,26 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
             for _ in range(self.num_layers)
         ])
 
-        if self.vn_router_type == 'mlp':
-            router_hidden = int(getattr(args, 'vn_rewire_hidden', self.h_dim))
-            self.router = nn.Sequential(
-                nn.Linear(self.h_dim, router_hidden, dtype=dtype),
-                nn.LeakyReLU(),
-                nn.Linear(router_hidden, self.num_vn, dtype=dtype),
-            )
-            self.router_proj = None
-            self.vn_anchors = None
-        elif self.vn_router_type == 'dot':
-            # Dot-product router: project raw node features (not H_real) into
-            # hidden space and attend to shared vn_emb anchors.
-            self.router = None
-            self.router_proj = nn.Linear(self.in_dim, self.h_dim, bias=False, dtype=dtype)
-            self.vn_anchors = None
-        else:
-            # 'simple': project real nodes and VN anchors into a shared router
-            # hidden space (d_router), then dot product. Two separate learnable
-            # tables: router_proj for reals, vn_anchors for VNs. d_router < h
-            # (e.g. 256) keeps the routing subspace small and decoupled from the
-            # main GAT hidden dim.
-            self.router = None
-            d_router = 64
-            self.router_proj = nn.Linear(self.in_dim, d_router, bias=False, dtype=dtype)
+        if self.vn_router_type == 'decoupled':
+            # Dedicated routing subspace of dim d_router, decoupled from both
+            # the GNN hidden space (h_dim) and from vn_emb. router_proj maps
+            # raw x -> d_router; vn_anchors are learnable unit-norm anchors in
+            # the same d_router space. Plain softmax over logits at fixed tau.
+            d_r = self.vn_d_router
+            self.router_proj = nn.Linear(self.in_dim, d_r, bias=False, dtype=dtype)
             self.vn_anchors = nn.Parameter(
-                torch.empty(self.num_vn, d_router, dtype=dtype)
+                torch.empty(self.num_vn, d_r, dtype=dtype)
             )
-            # Random Gaussian init + unit-norm rows on anchors (same choice as
-            # before, just now in d_router-dim space rather than in_dim-dim).
             nn.init.normal_(self.vn_anchors)
             with torch.no_grad():
                 self.vn_anchors.data = F.normalize(self.vn_anchors.data, dim=-1)
+        else:
+            # 'simple' and 'dynamic': fully shared router. No dedicated routing
+            # parameters — routing reuses in_lin (real-side) and vn_emb (VN-side)
+            # directly. 'simple' computes routing once pre-loop; 'dynamic'
+            # recomputes it at every layer inside the loop.
+            self.router_proj = None
+            self.vn_anchors = None
 
         self.vn_emb = nn.Embedding(self.num_vn, self.h_dim, dtype=dtype)
 
@@ -322,38 +317,6 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
     def set_tau(self, tau_value: float):
         """Mutate the Gumbel temperature (called from Lightning per-epoch hook)."""
         self.tau.fill_(float(tau_value))
-
-    def _gumbel_topk_softmax(self, logits: torch.Tensor) -> torch.Tensor:
-        """Sparse Gumbel top-k softmax: rows sum to 1, exactly k non-zeros.
-
-        If self.vn_ste is True, uses straight-through: forward is hard top-k
-        (each row has k entries each = 1/k, rest = 0); backward is dense soft
-        softmax over all m logits.
-        """
-        k = self.vn_per_node
-        tau = self.tau.clamp_min(1e-4)
-        U = torch.rand_like(logits).clamp_(1e-9, 1 - 1e-9)
-        gumbel = -torch.log(-torch.log(U))
-        noisy = (logits + gumbel) / tau
-
-        if self.vn_ste:
-            # Dense soft distribution over all m logits — carries gradient.
-            soft = F.softmax(noisy, dim=-1)
-            # Hard top-k assignment — used in forward only.
-            hard = torch.zeros_like(soft)
-            if k == 1:
-                idx = noisy.argmax(dim=-1, keepdim=True)
-                hard.scatter_(1, idx, 1.0)
-            else:
-                topk_idx = noisy.topk(k, dim=-1).indices
-                hard.scatter_(1, topk_idx, 1.0 / k)
-            # Straight-through: forward = hard, gradient flows through soft.
-            return hard - soft.detach() + soft
-
-        topk_vals, topk_idx = noisy.topk(k, dim=-1)
-        masked = torch.full_like(noisy, float('-inf'))
-        masked.scatter_(1, topk_idx, topk_vals)
-        return F.softmax(masked, dim=-1)
 
     def _oracle_S(self, data: Data, N: int, B: int, m: int) -> torch.Tensor:
         """
@@ -418,15 +381,20 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
 
         H_real = self.in_lin(x)                                              # (N, d)
 
+        # Routing strategies that produce S once, before the layer loop.
+        # 'dynamic' routing skips this branch entirely and computes S per-layer
+        # inside the loop using evolving H_real_b (query) and H_VN (anchor).
+        S_b = None
         if self.oracle_routing:
             S = self._oracle_S(data, N, B, m)                                # (N, m)
             with torch.no_grad():
                 self._last_routing_entropy = torch.tensor(0.0, device=x.device)
                 self._last_mean_top1 = S.max(dim=-1).values.mean().detach()
-        elif self.vn_router_type == 'simple':
-            # Project real nodes via router_proj(x) -> Z in R^{d_router}, and
-            # attend against vn_anchors living in the same d_router space.
-            # Plain temperature-softmax, no Gumbel, no STE, no annealing.
+            S_b = S.view(B, n_pg, m)
+        elif self.vn_router_type == 'decoupled':
+            # Dedicated routing subspace (d_router). logits = (W x) @ A.T where
+            # W = router_proj (in_dim -> d_router) and A = vn_anchors (m, d_router).
+            # Plain softmax, no Gumbel, no STE. Computed once, pre-loop.
             tau = self.tau.clamp_min(1e-4)
             Z = self.router_proj(x)                                           # (N, d_router)
             logits = Z @ self.vn_anchors.t()                                  # (N, m)
@@ -436,29 +404,42 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
                 ent = -(S.clamp_min(eps) * S.clamp_min(eps).log()).sum(-1).mean()
                 self._last_routing_entropy = ent.detach()
                 self._last_mean_top1 = S.max(dim=-1).values.mean().detach()
-        else:
-            if self.vn_router_type == 'dot':
-                # Attention-style router: project raw x, dot against VN anchors.
-                # Source_i and target_i have ~identical raw features on the id
-                # bits, so their projections align and they get nearly-identical
-                # logits -> same argmax -> natural rendezvous.
-                Z = self.router_proj(x)                                       # (N, d)
-                logits = Z @ self.vn_emb.weight.t() / math.sqrt(d)            # (N, m)
-            else:
-                logits = self.router(H_real)                                  # (N, m)
-            S = self._gumbel_topk_softmax(logits)                            # (N, m)
+            S_b = S.view(B, n_pg, m)
+        elif self.vn_router_type == 'simple':
+            # Fully shared router: reuse H_real (= in_lin(x)) as the query, and
+            # vn_emb.weight as the anchor table. No dedicated routing parameters.
+            # Plain temperature-softmax, no Gumbel, no STE, no annealing.
+            tau = self.tau.clamp_min(1e-4)
+            logits = H_real @ self.vn_emb.weight.t() / math.sqrt(d)           # (N, m)
+            S = F.softmax(logits / tau, dim=-1)                               # (N, m)
             with torch.no_grad():
                 eps = 1e-9
                 ent = -(S.clamp_min(eps) * S.clamp_min(eps).log()).sum(-1).mean()
                 self._last_routing_entropy = ent.detach()
                 self._last_mean_top1 = S.max(dim=-1).values.mean().detach()
+            S_b = S.view(B, n_pg, m)
+        else:  # 'dynamic'
+            # S is computed per-layer inside the loop below. Nothing to do here.
+            # Loop writes _last_routing_entropy / _last_mean_top1 from the
+            # final layer's S.
+            pass
 
-        S_b = S.view(B, n_pg, m)                                             # (B, n, m)
         H_real_b = H_real.view(B, n_pg, d)                                   # (B, n, d)
 
         H_VN = self.vn_emb.weight.unsqueeze(0).expand(B, m, d).contiguous()  # (B, m, d)
 
         for t, (gnn_layer, vn_mlp) in enumerate(zip(self.layers, self.vn_update)):
+            # 'dynamic': recompute routing at this layer using the CURRENT
+            # real-side state (H_real_b) as the query and the CURRENT VN
+            # state (H_VN) as the anchor. Cross-attention between the two
+            # evolving sides. On t=0 this equals the 'simple' routing since
+            # H_real_b = in_lin(x) and H_VN = vn_emb.weight (broadcast).
+            if self.vn_router_type == 'dynamic' and not self.oracle_routing:
+                tau = self.tau.clamp_min(1e-4)
+                # (B, n, d) @ (B, d, m) -> (B, n, m)
+                logits_t = torch.bmm(H_real_b, H_VN.transpose(1, 2)) / math.sqrt(d)
+                S_b = F.softmax(logits_t / tau, dim=-1)
+
             H_local_flat = gnn_layer(H_real_b.reshape(N, d), edge_index, edge_attr) \
                 if edge_attr is not None else gnn_layer(H_real_b.reshape(N, d), edge_index)
             H_local_b = H_local_flat.view(B, n_pg, d)
@@ -476,6 +457,15 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
             if self.use_activation:
                 H_next = F.leaky_relu(H_next)
             H_real_b = H_next
+
+        # For 'dynamic', log entropy/top1 from the final layer's routing.
+        if self.vn_router_type == 'dynamic' and not self.oracle_routing and S_b is not None:
+            with torch.no_grad():
+                S_flat = S_b.reshape(N, m)
+                eps = 1e-9
+                ent = -(S_flat.clamp_min(eps) * S_flat.clamp_min(eps).log()).sum(-1).mean()
+                self._last_routing_entropy = ent.detach()
+                self._last_mean_top1 = S_flat.max(dim=-1).values.mean().detach()
 
         return H_real_b.reshape(N, d)
 

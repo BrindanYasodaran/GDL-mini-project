@@ -18,10 +18,11 @@ Common:
   vn_residual: true 
   #dropout: 0.1 
   # Probabilistic virtual nodes (used only when --prob_vn is passed).
-  # All fields overrideable via CLI: --num_vn --vn_per_node --vn_tau_schedule
-  # --vn_tau_start --vn_tau_end --vn_tau_anneal_epochs.
+  # All fields overrideable via CLI.
   num_vn: 10
   vn_per_node: 2
+  vn_router: simple           # one of: decoupled, simple, dynamic
+  vn_d_router: 64             # routing subspace dim (used by 'decoupled' only)
   vn_tau_schedule: exp
   vn_tau_start: 5.0
   vn_tau_end: 0.1

@@ -33,7 +33,7 @@ RESULTS_CSV_COLUMNS = [
     'batch_size', 'max_epochs', 'target_acc',
     'use_virtual_nodes', 'num_virtual_nodes', 'vn_aggregation',
     'prob_vn', 'num_vn', 'vn_per_node', 'oracle_routing', 'oracle_route_centers',
-    'vn_ste', 'vn_router',
+    'vn_router', 'vn_d_router',
     'vn_tau_schedule', 'vn_tau_start', 'vn_tau_end', 'vn_tau_anneal_epochs',
     'num_heads', 'dropout', 'seed',
     'test_acc', 'best_val_acc', 'epochs_run',
@@ -138,10 +138,12 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
                 f"(router + Gumbel bypassed; S fixed from identifiers; {centers_str})"
             )
         else:
-            mode = "STE (hard forward / soft backward)" if getattr(args, 'vn_ste', False) else "dense soft"
-            router = getattr(args, 'vn_router', 'mlp')
+            router = getattr(args, 'vn_router', 'simple')
+            router_desc = router
+            if router == 'decoupled':
+                router_desc = f"decoupled (d_router={getattr(args, 'vn_d_router', 64)})"
             print(
-                f"Using Probabilistic Virtual Nodes [{mode}, router={router}] | "
+                f"Using Probabilistic Virtual Nodes [router={router_desc}] | "
                 f"m={getattr(args,'num_vn','NA')}, "
                 f"d={getattr(args,'vn_per_node','NA')}, "
                 f"tau_sched={getattr(args,'vn_tau_schedule','exp')}, "
@@ -172,10 +174,11 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
                 f"_probVN_ORACLE_m{getattr(args, 'num_vn', 'NA')}{centers_suffix}"
             )
         else:
-            ste_suffix = "_STE" if getattr(args, 'vn_ste', False) else ""
-            router_suffix = f"_r{getattr(args, 'vn_router', 'mlp')}"
+            router_suffix = f"_r{getattr(args, 'vn_router', 'simple')}"
+            if getattr(args, 'vn_router', None) == 'decoupled':
+                router_suffix += f"{int(getattr(args, 'vn_d_router', 64))}"
             prob_vn_tag = (
-                f"_probVN{ste_suffix}{router_suffix}"
+                f"_probVN{router_suffix}"
                 f"_m{getattr(args, 'num_vn', 'NA')}"
                 f"_d{getattr(args, 'vn_per_node', 'NA')}"
                 f"_tau{getattr(args, 'vn_tau_start', 'NA')}->"
@@ -360,8 +363,8 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
         'vn_per_node': getattr(args, 'vn_per_node', None),
         'oracle_routing': bool(getattr(args, 'oracle_routing', False)),
         'oracle_route_centers': bool(getattr(args, 'oracle_route_centers', False)),
-        'vn_ste': bool(getattr(args, 'vn_ste', False)),
-        'vn_router': getattr(args, 'vn_router', 'mlp'),
+        'vn_router': getattr(args, 'vn_router', 'simple'),
+        'vn_d_router': getattr(args, 'vn_d_router', 64),
         'vn_tau_schedule': getattr(args, 'vn_tau_schedule', None),
         'vn_tau_start': getattr(args, 'vn_tau_start', None),
         'vn_tau_end': getattr(args, 'vn_tau_end', None),
@@ -456,24 +459,24 @@ def parse_arguments() -> argparse.Namespace:
                         help='With --oracle_routing, also route centers via `id mod m` '
                              '(matching what a learned id-keyed router would do). Default: '
                              'centers have zero rows (clean source/target VN channel).')
-    parser.add_argument('--vn_ste', action='store_true', default=False,
-                        help='Use straight-through Gumbel-softmax for routing: forward '
-                             'pass uses hard top-k one-hot S (discriminative VN pathway '
-                             'from epoch 0, matches oracle forward); backward pass uses '
-                             'dense soft gradient. Fixes the "uniform S -> info-free '
-                             'pathway -> dead router" failure mode of dense soft routing.')
+    parser.add_argument('--vn_d_router', type=int, default=None,
+                        help="Routing subspace dimension for --vn_router=decoupled. "
+                             "Default: 64. Ignored for --vn_router simple|dynamic, "
+                             "which reuse the GNN hidden space (h_dim).")
     parser.add_argument('--vn_router', type=str, default=None,
-                        choices=['mlp', 'dot', 'simple'],
-                        help='Router logit function for --prob_vn. '
-                             '"mlp" (default): 2-layer MLP on H_real. '
-                             '"dot": Perceiver/ISA-style router that projects raw x '
-                             'and dots against vn_emb; preserves input similarity '
-                             'so source/target with shared id-bits naturally route '
-                             'to the same VN from epoch 0. '
-                             '"simple": minimal router - orthogonal anchors directly '
-                             'in input space, plain softmax, no Gumbel/STE/annealing. '
-                             'Use with small fixed tau (e.g. 0.1) and a constant '
-                             'schedule. Ignores --vn_per_node and --vn_ste.')
+                        choices=['decoupled', 'simple', 'dynamic'],
+                        help='Router logit function for --prob_vn. All three use '
+                             'plain softmax (no Gumbel/STE). '
+                             '"decoupled": dedicated routing subspace (dim=--vn_d_router, '
+                             'default 64) with separate router_proj and vn_anchors, '
+                             'fully decoupled from the GNN hidden space and from vn_emb. '
+                             'Computed once pre-loop. '
+                             '"simple": shared parameters - reuse in_lin (real query) and '
+                             'vn_emb (anchor), no dedicated router params. Computed once '
+                             'pre-loop. '
+                             '"dynamic": same shared-param setup as simple, but routing '
+                             'is recomputed at every layer from the evolving H_real_b and '
+                             'H_VN (cross-attention between the two evolving sides).')
     parser.add_argument('--K', type=int, default=1, 
                         help='Number of central nodes for two-radius problem (default: 1).')
     parser.add_argument('--num_heads', type=int, default=1, 
@@ -605,9 +608,10 @@ def main():
             config_args.vn_tau_anneal_epochs = args.vn_tau_anneal_epochs
         config_args.oracle_routing = bool(args.oracle_routing)
         config_args.oracle_route_centers = bool(args.oracle_route_centers)
-        config_args.vn_ste = bool(args.vn_ste)
         if args.vn_router is not None:
             config_args.vn_router = args.vn_router
+        if args.vn_d_router is not None:
+            config_args.vn_d_router = args.vn_d_router
         if args.oracle_routing and not args.prob_vn:
             raise ValueError(
                 "--oracle_routing requires --prob_vn; it replaces the learned router "
@@ -616,16 +620,6 @@ def main():
         if args.oracle_route_centers and not args.oracle_routing:
             raise ValueError(
                 "--oracle_route_centers requires --oracle_routing."
-            )
-        if args.vn_ste and not args.prob_vn:
-            raise ValueError(
-                "--vn_ste requires --prob_vn; it modifies the routing function "
-                "inside the probabilistic VN model."
-            )
-        if args.vn_ste and args.oracle_routing:
-            raise ValueError(
-                "--vn_ste and --oracle_routing are mutually exclusive: oracle routing "
-                "already uses a hard hand-crafted S."
             )
 
         config_args.target_acc = args.target_acc
