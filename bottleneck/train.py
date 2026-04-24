@@ -138,10 +138,14 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
                 f"(router + Gumbel bypassed; S fixed from identifiers; {centers_str})"
             )
         else:
-            router = getattr(args, 'vn_router', 'simple')
-            router_desc = router
+            router = getattr(args, 'vn_router', 'tied')
+            # Map internal name -> paper-facing abbreviation for console output.
+            _router_abbrev = {'decoupled': 'DPW', 'tied': 'TPW', 'adaptive': 'APW'}
+            router_desc = f"{_router_abbrev.get(router, router)} ({router})"
             if router == 'decoupled':
-                router_desc = f"decoupled (d_router={getattr(args, 'vn_d_router', 64)})"
+                router_desc = (
+                    f"DPW (decoupled, d_router={getattr(args, 'vn_d_router', 64)})"
+                )
             print(
                 f"Using Probabilistic Virtual Nodes [router={router_desc}] | "
                 f"m={getattr(args,'num_vn','NA')}, "
@@ -174,8 +178,11 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
                 f"_probVN_ORACLE_m{getattr(args, 'num_vn', 'NA')}{centers_suffix}"
             )
         else:
-            router_suffix = f"_r{getattr(args, 'vn_router', 'simple')}"
-            if getattr(args, 'vn_router', None) == 'decoupled':
+            # Paper-facing abbreviation in the run name: DPW / TPW / APW.
+            _router_tag_map = {'decoupled': 'DPW', 'tied': 'TPW', 'adaptive': 'APW'}
+            _router_name = getattr(args, 'vn_router', 'tied')
+            router_suffix = f"_{_router_tag_map.get(_router_name, _router_name)}"
+            if _router_name == 'decoupled':
                 router_suffix += f"{int(getattr(args, 'vn_d_router', 64))}"
             prob_vn_tag = (
                 f"_probVN{router_suffix}"
@@ -200,6 +207,8 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
         wandb_logger = WandbLogger(
             project=getattr(args, 'wandb_project', 'short-range-oversquashing'),
             name=run_name,
+            group=getattr(args, 'wandb_group', None),
+            tags=getattr(args, 'wandb_tags', None),
             config=dict(args),
             reinit=True,
         )
@@ -311,7 +320,16 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
     else:
         base_model = GraphModel(args=args)
     
-    model = LightningModel.load_from_checkpoint(best_checkpoint_path, args=args, task_id=task_id, model=base_model)
+    # weights_only=False: checkpoint hyperparameters contain EasyDict, which
+    # PyTorch 2.6+'s weights-only unpickler rejects (no SETITEMS support for
+    # non-stdlib dict subclasses, even when added via add_safe_globals).
+    model = LightningModel.load_from_checkpoint(
+        best_checkpoint_path,
+        args=args,
+        task_id=task_id,
+        model=base_model,
+        weights_only=False,
+    )
     
 
     test_loader_energy = DataLoader(
@@ -363,7 +381,7 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
         'vn_per_node': getattr(args, 'vn_per_node', None),
         'oracle_routing': bool(getattr(args, 'oracle_routing', False)),
         'oracle_route_centers': bool(getattr(args, 'oracle_route_centers', False)),
-        'vn_router': getattr(args, 'vn_router', 'simple'),
+        'vn_router': getattr(args, 'vn_router', 'tied'),
         'vn_d_router': getattr(args, 'vn_d_router', 64),
         'vn_tau_schedule': getattr(args, 'vn_tau_schedule', None),
         'vn_tau_start': getattr(args, 'vn_tau_start', None),
@@ -461,24 +479,34 @@ def parse_arguments() -> argparse.Namespace:
                              'centers have zero rows (clean source/target VN channel).')
     parser.add_argument('--vn_d_router', type=int, default=None,
                         help="Routing subspace dimension for --vn_router=decoupled. "
-                             "Default: 64. Ignored for --vn_router simple|dynamic, "
+                             "Default: 64. Ignored for --vn_router tied|adaptive, "
                              "which reuse the GNN hidden space (h_dim).")
     parser.add_argument('--vn_router', type=str, default=None,
-                        choices=['decoupled', 'simple', 'dynamic'],
-                        help='Router logit function for --prob_vn. All three use '
+                        choices=['decoupled', 'tied', 'adaptive'],
+                        help='Routing strategy for --prob_vn. All three use '
                              'plain softmax (no Gumbel/STE). '
-                             '"decoupled": dedicated routing subspace (dim=--vn_d_router, '
-                             'default 64) with separate router_proj and vn_anchors, '
-                             'fully decoupled from the GNN hidden space and from vn_emb. '
-                             'Computed once pre-loop. '
-                             '"simple": shared parameters - reuse in_lin (real query) and '
-                             'vn_emb (anchor), no dedicated router params. Computed once '
+                             '"decoupled" (DPW - Decoupled Probabilistic Wiring): '
+                             'dedicated routing subspace (dim=--vn_d_router, default 64) '
+                             'with separate router_proj and vn_anchors, fully decoupled '
+                             'from the GNN hidden space and from vn_emb. Computed once '
                              'pre-loop. '
-                             '"dynamic": same shared-param setup as simple, but routing '
-                             'is recomputed at every layer from the evolving H_real_b and '
-                             'H_VN (cross-attention between the two evolving sides).')
+                             '"tied" (TPW - Tied Probabilistic Wiring): shared parameters '
+                             '- reuses in_lin (real query) and vn_emb (anchor), no '
+                             'dedicated router params. Computed once pre-loop. '
+                             '"adaptive" (APW - Adaptive Probabilistic Wiring): same '
+                             'shared-param setup as TPW, but routing is recomputed at '
+                             'every layer from the evolving H_real_b and H_VN '
+                             '(cross-attention between the two evolving sides).')
     parser.add_argument('--K', type=int, default=1, 
                         help='Number of central nodes for two-radius problem (default: 1).')
+    parser.add_argument('--batch_size', type=int, default=None,
+                        help=('Override training batch size (Task_specific.<model>.<task>.batch_size '
+                              'in the YAML). Useful when OOM occurs at large K or large dim. '
+                              'Example: --batch_size 8.'))
+    parser.add_argument('--val_batch_size', type=int, default=None,
+                        help=('Override validation/test batch size (Common.val_batch_size in the '
+                              'YAML; default 256). Val OOMs often hit at large K because val batches '
+                              'are much larger than training batches. Example: --val_batch_size 32.'))
     parser.add_argument('--num_heads', type=int, default=1, 
                         help='Number of attention heads for SetTransformer model.')
     parser.add_argument('--heads', type=int, default=None,
@@ -496,6 +524,10 @@ def parse_arguments() -> argparse.Namespace:
                         help=('Override the maximum number of training epochs '
                               '(Task_specific.<model>.<task>.max_epochs in the YAML). '
                               'Leave unset to use the YAML value. Example: --max_epochs 500.'))
+    parser.add_argument('--eval_every', type=int, default=None,
+                        help=('Override how often validation runs (in epochs). '
+                              'Common.eval_every in the YAML (default: 5). '
+                              'Use --eval_every 1 for every-epoch val curves.'))
     parser.add_argument('--num_train_samples', type=int, default=None,
                         help=('Override num_train_samples (number of training graphs '
                               'per epoch). Leave unset to use the YAML value.'))
@@ -528,6 +560,13 @@ def parse_arguments() -> argparse.Namespace:
                              'Weights & Biases alongside the existing CSV logger.')
     parser.add_argument('--wandb_project', type=str, default='short-range-oversquashing',
                         help='W&B project name (only used when --wandb is set).')
+    parser.add_argument('--wandb_group', type=str, default=None,
+                        help='W&B group name. Runs in the same group are aggregated '
+                             'in plots (e.g., seed replicates with same hyperparams).')
+    parser.add_argument('--wandb_tags', type=str, nargs='+', default=None,
+                        help='W&B tags for this run. Multiple allowed: '
+                             '--wandb_tags P1 decoupled seed_replicates. '
+                             'Filterable in the W&B UI with a single click.')
     parser.add_argument('--results_csv', type=str, default='results/results.csv',
                         help='Path to a CSV file that receives one row per completed run '
                              '(final test accuracy + metadata). Created on first write.')
@@ -577,12 +616,18 @@ def main():
             config_args.lr = args.lr
         if args.max_epochs is not None:
             config_args.max_epochs = args.max_epochs
+        if args.eval_every is not None:
+            config_args.eval_every = args.eval_every
         if args.num_train_samples is not None:
             config_args.num_train_samples = args.num_train_samples
         if args.num_test_samples is not None:
             config_args.num_test_samples = args.num_test_samples
         if args.heads is not None:
             config_args.heads = args.heads
+        if args.batch_size is not None:
+            config_args.batch_size = args.batch_size
+        if args.val_batch_size is not None:
+            config_args.val_batch_size = args.val_batch_size
         if args.use_residual is not None:
             config_args.use_residual = args.use_residual
         config_args.lr_schedule = args.lr_schedule
@@ -625,6 +670,8 @@ def main():
         config_args.target_acc = args.target_acc
         config_args.use_wandb = args.wandb
         config_args.wandb_project = args.wandb_project
+        config_args.wandb_group = args.wandb_group
+        config_args.wandb_tags = args.wandb_tags
         config_args.results_csv = args.results_csv
 
 

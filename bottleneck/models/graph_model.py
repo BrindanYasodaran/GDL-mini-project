@@ -242,7 +242,8 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
         # Gumbel noise, no STE, no top-k sparsification). They differ only in
         # (a) parameter sharing and (b) when routing is computed:
         #
-        #   'decoupled': dedicated routing subspace of dim d_router (e.g. 64).
+        #   'decoupled' (Decoupled Probabilistic Wiring, DPW): dedicated
+        #     routing subspace of dim d_router (e.g. 64).
         #     logits = router_proj(x) @ vn_anchors.T
         #       router_proj:  (d_router, in_dim)  — separate from in_lin
         #       vn_anchors:   (m, d_router)       — separate from vn_emb
@@ -250,21 +251,23 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
         #     routing subspace can specialize purely for cluster assignment.
         #     Routing is computed ONCE, before the layer loop.
         #
-        #   'simple': fully shared parameters in GNN hidden space.
+        #   'tied' (Tied Probabilistic Wiring, TPW): fully shared parameters
+        #     in GNN hidden space.
         #     logits = in_lin(x) @ vn_emb.T / sqrt(h_dim)
         #       No router_proj, no vn_anchors. in_lin does double duty as both
         #       the GNN input projection and the real-side routing query;
         #       vn_emb does double duty as both initial VN state and routing
         #       anchor table. Routing is computed ONCE, before the layer loop.
         #
-        #   'dynamic': same shared-param setup as 'simple', but routing is
-        #     recomputed inside the layer loop at every layer t using the
-        #     CURRENT real-side state H_real_b (evolving) and the CURRENT VN
-        #     state H_VN (evolving). At t=0 this equals 'simple' exactly;
-        #     later layers let the router adapt as representations drift.
-        self.vn_router_type = str(getattr(args, 'vn_router', 'simple')).lower()
-        assert self.vn_router_type in ('decoupled', 'simple', 'dynamic'), (
-            f"vn_router must be 'decoupled', 'simple', or 'dynamic'; "
+        #   'adaptive' (Adaptive Probabilistic Wiring, APW): same shared-param
+        #     setup as 'tied', but routing is recomputed inside the layer loop
+        #     at every layer t using the CURRENT real-side state H_real_b
+        #     (evolving) and the CURRENT VN state H_VN (evolving). At t=0 this
+        #     equals 'tied' exactly; later layers let the router adapt as
+        #     representations drift.
+        self.vn_router_type = str(getattr(args, 'vn_router', 'tied')).lower()
+        assert self.vn_router_type in ('decoupled', 'tied', 'adaptive'), (
+            f"vn_router must be 'decoupled', 'tied', or 'adaptive'; "
             f"got {self.vn_router_type!r}"
         )
 
@@ -293,10 +296,10 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
             with torch.no_grad():
                 self.vn_anchors.data = F.normalize(self.vn_anchors.data, dim=-1)
         else:
-            # 'simple' and 'dynamic': fully shared router. No dedicated routing
-            # parameters — routing reuses in_lin (real-side) and vn_emb (VN-side)
-            # directly. 'simple' computes routing once pre-loop; 'dynamic'
-            # recomputes it at every layer inside the loop.
+            # 'tied' (TPW) and 'adaptive' (APW): fully shared router. No
+            # dedicated routing parameters — routing reuses in_lin (real-side)
+            # and vn_emb (VN-side) directly. 'tied' computes routing once
+            # pre-loop; 'adaptive' recomputes it at every layer inside the loop.
             self.router_proj = None
             self.vn_anchors = None
 
@@ -382,7 +385,7 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
         H_real = self.in_lin(x)                                              # (N, d)
 
         # Routing strategies that produce S once, before the layer loop.
-        # 'dynamic' routing skips this branch entirely and computes S per-layer
+        # 'adaptive' routing skips this branch entirely and computes S per-layer
         # inside the loop using evolving H_real_b (query) and H_VN (anchor).
         S_b = None
         if self.oracle_routing:
@@ -405,10 +408,10 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
                 self._last_routing_entropy = ent.detach()
                 self._last_mean_top1 = S.max(dim=-1).values.mean().detach()
             S_b = S.view(B, n_pg, m)
-        elif self.vn_router_type == 'simple':
-            # Fully shared router: reuse H_real (= in_lin(x)) as the query, and
-            # vn_emb.weight as the anchor table. No dedicated routing parameters.
-            # Plain temperature-softmax, no Gumbel, no STE, no annealing.
+        elif self.vn_router_type == 'tied':
+            # TPW: fully shared router — reuse H_real (= in_lin(x)) as the query,
+            # and vn_emb.weight as the anchor table. No dedicated routing
+            # parameters. Plain temperature-softmax, no Gumbel, no STE, no anneal.
             tau = self.tau.clamp_min(1e-4)
             logits = H_real @ self.vn_emb.weight.t() / math.sqrt(d)           # (N, m)
             S = F.softmax(logits / tau, dim=-1)                               # (N, m)
@@ -418,7 +421,7 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
                 self._last_routing_entropy = ent.detach()
                 self._last_mean_top1 = S.max(dim=-1).values.mean().detach()
             S_b = S.view(B, n_pg, m)
-        else:  # 'dynamic'
+        else:  # 'adaptive' (APW)
             # S is computed per-layer inside the loop below. Nothing to do here.
             # Loop writes _last_routing_entropy / _last_mean_top1 from the
             # final layer's S.
@@ -429,12 +432,12 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
         H_VN = self.vn_emb.weight.unsqueeze(0).expand(B, m, d).contiguous()  # (B, m, d)
 
         for t, (gnn_layer, vn_mlp) in enumerate(zip(self.layers, self.vn_update)):
-            # 'dynamic': recompute routing at this layer using the CURRENT
-            # real-side state (H_real_b) as the query and the CURRENT VN
-            # state (H_VN) as the anchor. Cross-attention between the two
-            # evolving sides. On t=0 this equals the 'simple' routing since
-            # H_real_b = in_lin(x) and H_VN = vn_emb.weight (broadcast).
-            if self.vn_router_type == 'dynamic' and not self.oracle_routing:
+            # 'adaptive' (APW): recompute routing at this layer using the
+            # CURRENT real-side state (H_real_b) as the query and the CURRENT
+            # VN state (H_VN) as the anchor. Cross-attention between the two
+            # evolving sides. On t=0 this equals the 'tied' (TPW) routing
+            # since H_real_b = in_lin(x) and H_VN = vn_emb.weight (broadcast).
+            if self.vn_router_type == 'adaptive' and not self.oracle_routing:
                 tau = self.tau.clamp_min(1e-4)
                 # (B, n, d) @ (B, d, m) -> (B, n, m)
                 logits_t = torch.bmm(H_real_b, H_VN.transpose(1, 2)) / math.sqrt(d)
@@ -458,8 +461,8 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
                 H_next = F.leaky_relu(H_next)
             H_real_b = H_next
 
-        # For 'dynamic', log entropy/top1 from the final layer's routing.
-        if self.vn_router_type == 'dynamic' and not self.oracle_routing and S_b is not None:
+        # For 'adaptive' (APW), log entropy/top1 from the final layer's routing.
+        if self.vn_router_type == 'adaptive' and not self.oracle_routing and S_b is not None:
             with torch.no_grad():
                 S_flat = S_b.reshape(N, m)
                 eps = 1e-9
