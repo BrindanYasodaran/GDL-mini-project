@@ -2,8 +2,8 @@
 
 ## Contribution
 
-This submission builds on the existing codebase for Two-Radius
-data generation, the training loop, baseline GNNs, and the SetTransformer model.
+This submission builds on the existing codebase from Mishayev et al. for Two-Radius
+data generation, the training loop, baseline GNNs, and the SetTransformer model
 My main contribution is the `GraphModelWithProbabilisticVirtualNodes` class in
 `bottleneck/models/graph_model.py` which allow for DPW/TPW/APW virtual node options on top of any base MPNN. This class also has the option for fixed identifier-matched virtual node wiring. I also added the corresponding CLI/config options in
 `bottleneck/train.py`.
