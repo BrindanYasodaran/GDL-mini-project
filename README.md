@@ -27,9 +27,6 @@ Main added arguments:
 - `--vn_d_router`: DPW routing subspace dimension.
 - `--vn_tau_start`, `--vn_tau_end`, `--vn_tau_schedule`, `--vn_tau_anneal_epochs`: routing-temperature schedule.
 - `--oracle_routing`: use fixed identifier-matched routing.
-- `--eval_every`: validation frequency.
-
-Add `--wandb --wandb_project <name>` to log to Weights & Biases (`wandb login` once).
 
 Default arguments are in `bottleneck/configs/task_config.yaml` and are overridden by CLI arguments.
 
