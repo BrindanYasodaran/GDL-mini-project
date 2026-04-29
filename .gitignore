@@ -18,12 +18,9 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.ipynb_checkpoints/
 .env
 .netrc
-
-# Local paper exports (often large); keep PDFs if you need them in-repo
-context/*_pages/
-.ipynb_checkpoints/
 
 # OS / editor
 .DS_Store
