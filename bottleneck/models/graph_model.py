@@ -192,86 +192,21 @@ class GraphModelWithVirtualNode(GraphModel):
 
 
 class GraphModelWithProbabilisticVirtualNodes(GraphModel):
-    """
-    Graph model with **probabilistic** virtual-node rewiring.
-
-    Architecture (once per forward):
-      1. Input projection  : X        -> H_real^(0)   in (N, dim)
-      2. Router (once)     : H_real^(0) -> logits     in (N, m)
-         Gumbel top-k softmax with temperature tau gives soft assignment
-         S in (N, m); each row sums to 1 and has exactly `vn_per_node` (=k)
-         non-zero entries.
-      3. Per-layer t = 1..L, with VN table H_VN in (B, m, dim):
-         A. H_local    = GNN_layer(H_real, original_edge_index)
-         B. vn_agg     = S^T  @ H_local        (bmm over batch)
-            H_VN      <- MLP_up( H_VN + vn_agg )
-         C. H_global   = S    @ H_VN           (bmm over batch)
-            H_real'   = H_local + H_global  (+ residual / layernorm / activation)
-
-    Differs from IPR-MPNN (Qian et al. 2024):
-      - router is an MLP, not an MPNN
-      - sampling is Gumbel top-k with soft softmax (paper uses SIMPLE k-subset)
-      - no VN<->VN complete graph
-      - single sample per forward (q=1)
-      - VN init is a learnable table broadcast across graphs
-    """
-
     def __init__(self, args: EasyDict):
         super().__init__(args)
 
         dtype = dtype_mapping[args.dtype]
 
         self.num_vn = int(getattr(args, 'num_vn', 10))
-        self.vn_per_node = int(getattr(args, 'vn_per_node', 2))
-        assert 1 <= self.vn_per_node <= self.num_vn, (
-            f"vn_per_node must satisfy 1 <= d <= m; got d={self.vn_per_node}, m={self.num_vn}"
-        )
 
-        # Oracle routing: if True, bypass the router MLP and Gumbel sampling and
-        # build S directly from node identifiers so that every source shares a VN
-        # with its matching target. Used to ablate "is the VN mechanism itself
-        # useful, given perfect routing?".
         self.oracle_routing = bool(getattr(args, 'oracle_routing', False))
-        # Whether centers also participate in the VN mechanism under oracle routing.
-        # False (default) -> centers get zero rows (clean source/target channel).
-        # True              -> centers route to VN `id mod m`, matching what a learned
-        #                      id-keyed router would do.
-        self.oracle_route_centers = bool(getattr(args, 'oracle_route_centers', False))
 
-        # Router logit function. All three use plain temperature-softmax (no
-        # Gumbel noise, no STE, no top-k sparsification). They differ only in
-        # (a) parameter sharing and (b) when routing is computed:
-        #
-        #   'decoupled' (Decoupled Probabilistic Wiring, DPW): dedicated
-        #     routing subspace of dim d_router (e.g. 64).
-        #     logits = router_proj(x) @ vn_anchors.T
-        #       router_proj:  (d_router, in_dim)  — separate from in_lin
-        #       vn_anchors:   (m, d_router)       — separate from vn_emb
-        #     Fully decoupled from the GNN hidden space and from vn_emb. The
-        #     routing subspace can specialize purely for cluster assignment.
-        #     Routing is computed ONCE, before the layer loop.
-        #
-        #   'tied' (Tied Probabilistic Wiring, TPW): fully shared parameters
-        #     in GNN hidden space.
-        #     logits = in_lin(x) @ vn_emb.T / sqrt(h_dim)
-        #       No router_proj, no vn_anchors. in_lin does double duty as both
-        #       the GNN input projection and the real-side routing query;
-        #       vn_emb does double duty as both initial VN state and routing
-        #       anchor table. Routing is computed ONCE, before the layer loop.
-        #
-        #   'adaptive' (Adaptive Probabilistic Wiring, APW): same shared-param
-        #     setup as 'tied', but routing is recomputed inside the layer loop
-        #     at every layer t using the CURRENT real-side state H_real_b
-        #     (evolving) and the CURRENT VN state H_VN (evolving). At t=0 this
-        #     equals 'tied' exactly; later layers let the router adapt as
-        #     representations drift.
         self.vn_router_type = str(getattr(args, 'vn_router', 'tied')).lower()
         assert self.vn_router_type in ('decoupled', 'tied', 'adaptive'), (
             f"vn_router must be 'decoupled', 'tied', or 'adaptive'; "
             f"got {self.vn_router_type!r}"
         )
 
-        # Router subspace dimension (used only by 'decoupled').
         self.vn_d_router = int(getattr(args, 'vn_d_router', 64))
 
         self.register_buffer('tau', torch.tensor(float(getattr(args, 'vn_tau_start', 5.0))))
@@ -283,10 +218,6 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
         ])
 
         if self.vn_router_type == 'decoupled':
-            # Dedicated routing subspace of dim d_router, decoupled from both
-            # the GNN hidden space (h_dim) and from vn_emb. router_proj maps
-            # raw x -> d_router; vn_anchors are learnable unit-norm anchors in
-            # the same d_router space. Plain softmax over logits at fixed tau.
             d_r = self.vn_d_router
             self.router_proj = nn.Linear(self.in_dim, d_r, bias=False, dtype=dtype)
             self.vn_anchors = nn.Parameter(
@@ -296,10 +227,6 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
             with torch.no_grad():
                 self.vn_anchors.data = F.normalize(self.vn_anchors.data, dim=-1)
         else:
-            # 'tied' (TPW) and 'adaptive' (APW): fully shared router. No
-            # dedicated routing parameters — routing reuses in_lin (real-side)
-            # and vn_emb (VN-side) directly. 'tied' computes routing once
-            # pre-loop; 'adaptive' recomputes it at every layer inside the loop.
             self.router_proj = None
             self.vn_anchors = None
 
@@ -318,50 +245,21 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
         self._last_mean_top1 = None
 
     def set_tau(self, tau_value: float):
-        """Mutate the Gumbel temperature (called from Lightning per-epoch hook)."""
+        """Set routing temperature."""
         self.tau.fill_(float(tau_value))
 
-    def _oracle_S(self, data: Data, N: int, B: int, m: int) -> torch.Tensor:
-        """
-        Hand-crafted routing matrix S of shape (N, m):
-          - Each source / target node v is routed to exactly one VN, at index
-            `identifier(v) mod m`. Sources and matching targets share an
-            identifier, so they share a VN.
-          - Centers: routed to `id mod m` iff `self.oracle_route_centers` is
-            True; otherwise their row is left all-zero (excluded from the VN
-            mechanism).
-        Assumes uniform graph size and the default TwoRadius node layout
-        [A (sources) | C (centers) | B (targets)].
-        """
+    def _oracle_S(self, data: Data, N: int, m: int) -> torch.Tensor:
         x = data.x
         device = x.device
         dtype = x.dtype
 
-        # First (in_dim - num_classes) feature dims are the one-hot identifier.
         id_dim = self.in_dim - self.out_dim
         assert id_dim > 0, f"Expected positive id_dim, got {id_dim}"
-        ids = x[:, :id_dim].argmax(dim=-1)                                 # (N,)
-
-        # Infer per-graph layout. For TwoRadius: graph_size = 2n + K, with
-        # `test_mask` True on the last n nodes of each graph (the targets).
-        graph_size = N // B
-        n_targets_total = int(data.test_mask.sum().item())
-        assert n_targets_total % B == 0, (
-            f"test_mask sum {n_targets_total} not divisible by batch size {B}; "
-            "oracle routing assumes uniform target count per graph."
-        )
-        n = n_targets_total // B
-        K_centers = graph_size - 2 * n
-
-        local_idx = torch.arange(N, device=device) % graph_size            # (N,)
-        is_source = local_idx < n
-        is_target = local_idx >= (n + K_centers)
-        is_st = is_source | is_target                                      # (N,)
+        ids = x[:, :id_dim].argmax(dim=-1)
 
         S = torch.zeros(N, m, device=device, dtype=dtype)
-        vn_idx = (ids % m).long()                                          # (N,)
-        route_mask = is_st if not self.oracle_route_centers else torch.ones_like(is_st)
-        rows = torch.nonzero(route_mask, as_tuple=False).squeeze(-1)
+        vn_idx = (ids % m).long()
+        rows = torch.arange(N, device=device)
         S[rows, vn_idx[rows]] = 1.0
         return S
 
@@ -382,26 +280,20 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
         d = self.h_dim
         m = self.num_vn
 
-        H_real = self.in_lin(x)                                              # (N, d)
+        H_real = self.in_lin(x)
 
-        # Routing strategies that produce S once, before the layer loop.
-        # 'adaptive' routing skips this branch entirely and computes S per-layer
-        # inside the loop using evolving H_real_b (query) and H_VN (anchor).
         S_b = None
         if self.oracle_routing:
-            S = self._oracle_S(data, N, B, m)                                # (N, m)
+            S = self._oracle_S(data, N, m)
             with torch.no_grad():
                 self._last_routing_entropy = torch.tensor(0.0, device=x.device)
                 self._last_mean_top1 = S.max(dim=-1).values.mean().detach()
             S_b = S.view(B, n_pg, m)
         elif self.vn_router_type == 'decoupled':
-            # Dedicated routing subspace (d_router). logits = (W x) @ A.T where
-            # W = router_proj (in_dim -> d_router) and A = vn_anchors (m, d_router).
-            # Plain softmax, no Gumbel, no STE. Computed once, pre-loop.
             tau = self.tau.clamp_min(1e-4)
-            Z = self.router_proj(x)                                           # (N, d_router)
-            logits = Z @ self.vn_anchors.t()                                  # (N, m)
-            S = F.softmax(logits / tau, dim=-1)                               # (N, m)
+            Z = self.router_proj(x)
+            logits = Z @ self.vn_anchors.t()
+            S = F.softmax(logits / tau, dim=-1)
             with torch.no_grad():
                 eps = 1e-9
                 ent = -(S.clamp_min(eps) * S.clamp_min(eps).log()).sum(-1).mean()
@@ -409,12 +301,9 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
                 self._last_mean_top1 = S.max(dim=-1).values.mean().detach()
             S_b = S.view(B, n_pg, m)
         elif self.vn_router_type == 'tied':
-            # TPW: fully shared router — reuse H_real (= in_lin(x)) as the query,
-            # and vn_emb.weight as the anchor table. No dedicated routing
-            # parameters. Plain temperature-softmax, no Gumbel, no STE, no anneal.
             tau = self.tau.clamp_min(1e-4)
-            logits = H_real @ self.vn_emb.weight.t() / math.sqrt(d)           # (N, m)
-            S = F.softmax(logits / tau, dim=-1)                               # (N, m)
+            logits = H_real @ self.vn_emb.weight.t() / math.sqrt(d)
+            S = F.softmax(logits / tau, dim=-1)
             with torch.no_grad():
                 eps = 1e-9
                 ent = -(S.clamp_min(eps) * S.clamp_min(eps).log()).sum(-1).mean()
@@ -422,24 +311,15 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
                 self._last_mean_top1 = S.max(dim=-1).values.mean().detach()
             S_b = S.view(B, n_pg, m)
         else:  # 'adaptive' (APW)
-            # S is computed per-layer inside the loop below. Nothing to do here.
-            # Loop writes _last_routing_entropy / _last_mean_top1 from the
-            # final layer's S.
             pass
 
-        H_real_b = H_real.view(B, n_pg, d)                                   # (B, n, d)
+        H_real_b = H_real.view(B, n_pg, d)
 
-        H_VN = self.vn_emb.weight.unsqueeze(0).expand(B, m, d).contiguous()  # (B, m, d)
+        H_VN = self.vn_emb.weight.unsqueeze(0).expand(B, m, d).contiguous()
 
         for t, (gnn_layer, vn_mlp) in enumerate(zip(self.layers, self.vn_update)):
-            # 'adaptive' (APW): recompute routing at this layer using the
-            # CURRENT real-side state (H_real_b) as the query and the CURRENT
-            # VN state (H_VN) as the anchor. Cross-attention between the two
-            # evolving sides. On t=0 this equals the 'tied' (TPW) routing
-            # since H_real_b = in_lin(x) and H_VN = vn_emb.weight (broadcast).
             if self.vn_router_type == 'adaptive' and not self.oracle_routing:
                 tau = self.tau.clamp_min(1e-4)
-                # (B, n, d) @ (B, d, m) -> (B, n, m)
                 logits_t = torch.bmm(H_real_b, H_VN.transpose(1, 2)) / math.sqrt(d)
                 S_b = F.softmax(logits_t / tau, dim=-1)
 
@@ -447,10 +327,10 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
                 if edge_attr is not None else gnn_layer(H_real_b.reshape(N, d), edge_index)
             H_local_b = H_local_flat.view(B, n_pg, d)
 
-            vn_agg = torch.bmm(S_b.transpose(1, 2), H_local_b)               # (B, m, d)
+            vn_agg = torch.bmm(S_b.transpose(1, 2), H_local_b)
             H_VN = vn_mlp(H_VN + vn_agg)
 
-            H_global_b = torch.bmm(S_b, H_VN)                                # (B, n, d)
+            H_global_b = torch.bmm(S_b, H_VN)
 
             H_next = H_local_b + H_global_b
             if self.use_residual and t > 0:
@@ -461,7 +341,6 @@ class GraphModelWithProbabilisticVirtualNodes(GraphModel):
                 H_next = F.leaky_relu(H_next)
             H_real_b = H_next
 
-        # For 'adaptive' (APW), log entropy/top1 from the final layer's routing.
         if self.vn_router_type == 'adaptive' and not self.oracle_routing and S_b is not None:
             with torch.no_grad():
                 S_flat = S_b.reshape(N, m)

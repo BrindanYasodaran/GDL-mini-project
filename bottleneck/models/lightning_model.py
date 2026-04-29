@@ -92,7 +92,7 @@ class LightningModel(pl.LightningModule):
             self.log('vn_tau', float(tau), on_step=False, on_epoch=True)
 
     def _current_tau(self) -> float:
-        """Compute the Gumbel-softmax temperature for the current epoch."""
+        """Compute the routing temperature for the current epoch."""
         e = int(self.current_epoch)
         anneal = max(int(self.vn_tau_anneal_epochs), 1)
         frac = min(e / anneal, 1.0)

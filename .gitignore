@@ -4,6 +4,7 @@ bottleneck/data/
 bottleneck/wandb/
 bottleneck/csv_logs/
 bottleneck/results/
+bottleneck/logs/
 bottleneck/lightning_logs/
 **/checkpoints/
 **/*.ckpt
@@ -17,6 +18,11 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.env
+.netrc
+
+# Local paper exports (often large); keep PDFs if you need them in-repo
+context/*_pages/
 .ipynb_checkpoints/
 
 # OS / editor

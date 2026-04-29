@@ -1,29 +1,5 @@
 #!/usr/bin/env bash
-# VN routing strategies sweep at n=100.
-#
-# Three probabilistic-wiring strategies (paper-facing names in CAPS):
-#   DPW  = Decoupled Probabilistic Wiring  (CLI: --vn_router decoupled)
-#   TPW  = Tied      Probabilistic Wiring  (CLI: --vn_router tied)
-#   APW  = Adaptive  Probabilistic Wiring  (CLI: --vn_router adaptive)
-#
-# Parts:
-#   Part 1: Primary comparison: 3 strategies x 3 seeds (9 runs)
-#     Tags: P1, <DPW|TPW|APW>, m25, tau_fixed_0.1, dim1024
-#     Groups: P1_DPW_d64 | P1_TPW | P1_APW (seed replicates aggregate within
-#             each group in W&B plots).
-#   Part 2A: DPW d_router ablation (2 runs).              Tag: P2A.
-#   Part 2B: APW temperature annealing (2 runs).          Tag: P2B.
-#   Part 2C: TPW temperature annealing (1 run).           Tag: P2C.
-#   Part 2D: oracle topline (1 run).                      Tag: P2D.
-#   Part 2E: no-VN GAT baseline (1 run).                  Tag: P2E.
-#   Part 2F: dim vs num_vn sweep on APW (7 runs).         Tag: P2F.
-#
-# Total: 23 runs, ~8.6h.
-#
-# In W&B UI, filter by tag (e.g. "P2F") to see just that part; group lets
-# seed replicates aggregate with mean/stderr bands automatically.
-
-set -u  # DO NOT set -e: we want to continue past per-run failures
+set -u
 
 SWEEP_NAME="vn_strategies_$(date +%Y%m%d_%H%M%S)"
 WANDB_PROJECT="sro-vn-strategies"
@@ -38,13 +14,8 @@ echo "Sweep start: $(date)"                                        | tee "$SUMMA
 echo "Results CSV: $RESULTS_CSV"                                   | tee -a "$SUMMARY_LOG"
 echo "Per-run logs: $LOG_DIR/"                                     | tee -a "$SUMMARY_LOG"
 echo "W&B project: $WANDB_PROJECT"                                 | tee -a "$SUMMARY_LOG"
-echo "W&B filter tips:"                                            | tee -a "$SUMMARY_LOG"
-echo "  - tag:'P1' etc. to see one part"                           | tee -a "$SUMMARY_LOG"
-echo "  - tag:'DPW' / 'TPW' / 'APW' to see strategy"               | tee -a "$SUMMARY_LOG"
-echo "  - group view aggregates seed replicates"                   | tee -a "$SUMMARY_LOG"
 echo ""                                                            | tee -a "$SUMMARY_LOG"
 
-# Shared flags across every run.
 N_BASE=100
 COMMON=(
     --task_type two --star_variant connected
@@ -59,7 +30,6 @@ COMMON=(
     --results_csv "$RESULTS_CSV"
 )
 
-# Defaults for prob_vn runs: fixed tau=0.1, 25 VNs, no anneal.
 PROB_VN_DEFAULTS=(
     --prob_vn
     --num_vn 25
@@ -70,17 +40,15 @@ PROB_VN_DEFAULTS=(
 TOTAL_RUNS=23
 RUN_IDX=0
 
-# run_one <tag> <group> <tag1> <tag2> ... -- <extra_train_args>
 run_one() {
     local tag="$1"; shift
     local group="$1"; shift
-    # Collect tags until we hit '--'
     local tags=()
     while [ "$1" != "--" ]; do
         tags+=("$1")
         shift
     done
-    shift  # drop the '--'
+    shift
 
     RUN_IDX=$((RUN_IDX + 1))
     local t_start=$(date +%s)
@@ -101,9 +69,6 @@ run_one() {
     fi
 }
 
-# =============================================================================
-# PART 1 -- Primary comparison: 3 strategies x 3 seeds = 9 runs
-# =============================================================================
 echo "=== Part 1: Primary comparison (3 strategies x 3 seeds) ===" | tee -a "$SUMMARY_LOG"
 for SEED in 1 2 3; do
     run_one \
@@ -134,9 +99,6 @@ for SEED in 1 2 3; do
         "${PROB_VN_DEFAULTS[@]}" "${COMMON[@]}"
 done
 
-# =============================================================================
-# PART 2A -- DPW d_router ablation (seed=1, 2 runs)
-# =============================================================================
 echo "=== Part 2A: DPW d_router ablation ===" | tee -a "$SUMMARY_LOG"
 for DR in 16 256; do
     run_one \
@@ -149,9 +111,6 @@ for DR in 16 256; do
         "${PROB_VN_DEFAULTS[@]}" "${COMMON[@]}"
 done
 
-# =============================================================================
-# PART 2B -- APW temperature annealing (seed=1, 2 runs)
-# =============================================================================
 echo "=== Part 2B: APW temperature annealing ===" | tee -a "$SUMMARY_LOG"
 run_one \
     "P2B_APW_anneal_exp5.0-0.1_50ep_s1" \
@@ -177,9 +136,6 @@ run_one \
     --vn_tau_anneal_epochs 30 --vn_tau_schedule linear \
     "${COMMON[@]}"
 
-# =============================================================================
-# PART 2C -- TPW temperature annealing (seed=1, 1 run)
-# =============================================================================
 echo "=== Part 2C: TPW temperature annealing ===" | tee -a "$SUMMARY_LOG"
 run_one \
     "P2C_TPW_anneal_exp5.0-0.1_50ep_s1" \
@@ -193,9 +149,6 @@ run_one \
     --vn_tau_anneal_epochs 50 --vn_tau_schedule exp \
     "${COMMON[@]}"
 
-# =============================================================================
-# PART 2D -- oracle topline (seed=1, 1 run)
-# =============================================================================
 echo "=== Part 2D: oracle routing topline ===" | tee -a "$SUMMARY_LOG"
 run_one \
     "P2D_oracle_s1" \
@@ -207,9 +160,6 @@ run_one \
     --oracle_routing \
     "${PROB_VN_DEFAULTS[@]}" "${COMMON[@]}"
 
-# =============================================================================
-# PART 2E -- no-VN baseline (seed=1, 1 run)
-# =============================================================================
 echo "=== Part 2E: no-VN baseline (GAT) ===" | tee -a "$SUMMARY_LOG"
 run_one \
     "P2E_GAT_noVN_s1" \
@@ -219,9 +169,6 @@ run_one \
     --dim 1024 --seed 1 \
     "${COMMON[@]}"
 
-# =============================================================================
-# PART 2F -- dim vs num_vn sweep on APW (seed=1, 7 runs)
-# =============================================================================
 echo "=== Part 2F: dim vs num_vn sweep (APW) ===" | tee -a "$SUMMARY_LOG"
 for DIM in 256 1024; do
     for M in 1 5 10 25; do

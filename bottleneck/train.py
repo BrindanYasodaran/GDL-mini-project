@@ -32,7 +32,7 @@ RESULTS_CSV_COLUMNS = [
     'depth', 'dim', 'lr', 'lr_schedule', 'lr_factor',
     'batch_size', 'max_epochs', 'target_acc',
     'use_virtual_nodes', 'num_virtual_nodes', 'vn_aggregation',
-    'prob_vn', 'num_vn', 'vn_per_node', 'oracle_routing', 'oracle_route_centers',
+    'prob_vn', 'num_vn', 'oracle_routing',
     'vn_router', 'vn_d_router',
     'vn_tau_schedule', 'vn_tau_start', 'vn_tau_end', 'vn_tau_anneal_epochs',
     'num_heads', 'dropout', 'seed',
@@ -129,17 +129,12 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
         )
         base_model = GraphModelWithProbabilisticVirtualNodes(args=args)
         if getattr(args, 'oracle_routing', False):
-            centers_str = (
-                "centers routed via id mod m" if getattr(args, 'oracle_route_centers', False)
-                else "centers excluded (zero rows)"
-            )
             print(
                 f"Using ORACLE-routed Virtual Nodes | m={getattr(args,'num_vn','NA')} "
-                f"(router + Gumbel bypassed; S fixed from identifiers; {centers_str})"
+                f"(S fixed from identifiers)"
             )
         else:
             router = getattr(args, 'vn_router', 'tied')
-            # Map internal name -> paper-facing abbreviation for console output.
             _router_abbrev = {'decoupled': 'DPW', 'tied': 'TPW', 'adaptive': 'APW'}
             router_desc = f"{_router_abbrev.get(router, router)} ({router})"
             if router == 'decoupled':
@@ -149,7 +144,6 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
             print(
                 f"Using Probabilistic Virtual Nodes [router={router_desc}] | "
                 f"m={getattr(args,'num_vn','NA')}, "
-                f"d={getattr(args,'vn_per_node','NA')}, "
                 f"tau_sched={getattr(args,'vn_tau_schedule','exp')}, "
                 f"tau_start={getattr(args,'vn_tau_start','NA')} -> "
                 f"tau_end={getattr(args,'vn_tau_end','NA')} over "
@@ -171,14 +165,10 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
     prob_vn_tag = ""
     if getattr(args, 'prob_vn', False):
         if getattr(args, 'oracle_routing', False):
-            centers_suffix = (
-                "_withC" if getattr(args, 'oracle_route_centers', False) else ""
-            )
             prob_vn_tag = (
-                f"_probVN_ORACLE_m{getattr(args, 'num_vn', 'NA')}{centers_suffix}"
+                f"_probVN_ORACLE_m{getattr(args, 'num_vn', 'NA')}"
             )
         else:
-            # Paper-facing abbreviation in the run name: DPW / TPW / APW.
             _router_tag_map = {'decoupled': 'DPW', 'tied': 'TPW', 'adaptive': 'APW'}
             _router_name = getattr(args, 'vn_router', 'tied')
             router_suffix = f"_{_router_tag_map.get(_router_name, _router_name)}"
@@ -187,7 +177,6 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
             prob_vn_tag = (
                 f"_probVN{router_suffix}"
                 f"_m{getattr(args, 'num_vn', 'NA')}"
-                f"_d{getattr(args, 'vn_per_node', 'NA')}"
                 f"_tau{getattr(args, 'vn_tau_start', 'NA')}->"
                 f"{getattr(args, 'vn_tau_end', 'NA')}"
                 f"_{getattr(args, 'vn_tau_schedule', 'exp')}"
@@ -294,7 +283,6 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
         num_workers=args.loader_workers
     )
 
-    # Train the model
     print(f'Starting training with star_variant: {args.star_variant}, virtual_nodes: {args.use_virtual_nodes}...')
     trainer.fit(model, train_loader, val_loader)
 
@@ -378,9 +366,7 @@ def train_graphs(args: EasyDict, task_specific: dict, task_id: int, seed: int) -
         'vn_aggregation': getattr(args, 'vn_aggregation', None),
         'prob_vn': bool(getattr(args, 'prob_vn', False)),
         'num_vn': getattr(args, 'num_vn', None),
-        'vn_per_node': getattr(args, 'vn_per_node', None),
         'oracle_routing': bool(getattr(args, 'oracle_routing', False)),
-        'oracle_route_centers': bool(getattr(args, 'oracle_route_centers', False)),
         'vn_router': getattr(args, 'vn_router', 'tied'),
         'vn_d_router': getattr(args, 'vn_d_router', 64),
         'vn_tau_schedule': getattr(args, 'vn_tau_schedule', None),
@@ -439,64 +425,43 @@ def parse_arguments() -> argparse.Namespace:
                         help='Number of virtual nodes to use (default: use config file).')
     parser.add_argument('--use_residual', dest='use_residual', action='store_true',
                         default=None,
-                        help='Enable backbone MPNN residual (input→output skip per layer). '
+                        help='Enable backbone MPNN residual (input-output skip per layer). '
                              'Overrides the YAML. Default: use YAML value.')
     parser.add_argument('--no_residual', dest='use_residual', action='store_false',
                         help='Disable backbone MPNN residual. Overrides the YAML.')
     parser.add_argument('--vn_aggregation', type=str, default=None,
                         choices=['sum', 'mean'],
                         help='Aggregation method for multiple virtual nodes (default: sum).')
-    # Probabilistic Virtual Nodes (IPR-MPNN-style, simplified)
     parser.add_argument('--prob_vn', action='store_true', default=False,
-                        help='Enable probabilistic VN rewiring (Gumbel top-k soft '
-                             'routing + per-layer VN update). Cannot be combined '
+                        help='Enable probabilistic VN rewiring (softmax routing '
+                             '+ per-layer VN update). Cannot be combined '
                              'with --use_virtual_nodes.')
     parser.add_argument('--num_vn', type=int, default=None,
                         help='Number of virtual nodes m for --prob_vn (default from YAML: 10).')
-    parser.add_argument('--vn_per_node', type=int, default=None,
-                        help='Connections-per-node d for --prob_vn; must satisfy d <= m '
-                             '(default from YAML: 2).')
     parser.add_argument('--vn_tau_schedule', type=str, default=None,
                         choices=['constant', 'linear', 'exp'],
-                        help='Gumbel temperature schedule for --prob_vn '
+                        help='Routing-temperature schedule for --prob_vn '
                              '(default from YAML: exp).')
     parser.add_argument('--vn_tau_start', type=float, default=None,
-                        help='Initial Gumbel temperature tau at epoch 0 (default 5.0).')
+                        help='Initial routing temperature tau at epoch 0 (default 5.0).')
     parser.add_argument('--vn_tau_end', type=float, default=None,
-                        help='Final Gumbel temperature tau after annealing (default 0.1).')
+                        help='Final routing temperature tau after annealing (default 0.1).')
     parser.add_argument('--vn_tau_anneal_epochs', type=int, default=None,
                         help='Number of epochs over which tau anneals from start to end '
                              '(default 100). Epochs beyond this are pinned at vn_tau_end.')
     parser.add_argument('--oracle_routing', action='store_true', default=False,
-                        help='With --prob_vn, bypass the router MLP and Gumbel sampling '
-                             'and build a hand-crafted hard routing S directly from node '
+                        help='With --prob_vn, build hard routing S directly from node '
                              'identifiers so every source shares a VN with its matching '
-                             'target (id mod num_vn). Centers get zero rows by default. '
-                             'Isolates the VN mechanism from routing-learning.')
-    parser.add_argument('--oracle_route_centers', action='store_true', default=False,
-                        help='With --oracle_routing, also route centers via `id mod m` '
-                             '(matching what a learned id-keyed router would do). Default: '
-                             'centers have zero rows (clean source/target VN channel).')
+                             'target (id mod num_vn).')
     parser.add_argument('--vn_d_router', type=int, default=None,
                         help="Routing subspace dimension for --vn_router=decoupled. "
                              "Default: 64. Ignored for --vn_router tied|adaptive, "
                              "which reuse the GNN hidden space (h_dim).")
     parser.add_argument('--vn_router', type=str, default=None,
                         choices=['decoupled', 'tied', 'adaptive'],
-                        help='Routing strategy for --prob_vn. All three use '
-                             'plain softmax (no Gumbel/STE). '
-                             '"decoupled" (DPW - Decoupled Probabilistic Wiring): '
-                             'dedicated routing subspace (dim=--vn_d_router, default 64) '
-                             'with separate router_proj and vn_anchors, fully decoupled '
-                             'from the GNN hidden space and from vn_emb. Computed once '
-                             'pre-loop. '
-                             '"tied" (TPW - Tied Probabilistic Wiring): shared parameters '
-                             '- reuses in_lin (real query) and vn_emb (anchor), no '
-                             'dedicated router params. Computed once pre-loop. '
-                             '"adaptive" (APW - Adaptive Probabilistic Wiring): same '
-                             'shared-param setup as TPW, but routing is recomputed at '
-                             'every layer from the evolving H_real_b and H_VN '
-                             '(cross-attention between the two evolving sides).')
+                        help=('Routing strategy for --prob_vn: decoupled (DPW, '
+                              'separate routing subspace), tied (TPW, shared input/VN '
+                              'parameters), or adaptive (APW, recomputed per layer).'))
     parser.add_argument('--K', type=int, default=1, 
                         help='Number of central nodes for two-radius problem (default: 1).')
     parser.add_argument('--batch_size', type=int, default=None,
@@ -544,7 +509,7 @@ def parse_arguments() -> argparse.Namespace:
                               '"none" (default) keeps lr constant. '
                               '"plateau_train" is the original repo behaviour '
                               '(ReduceLROnPlateau monitoring train_acc). '
-                              '"plateau_val" monitors val_acc instead — note that '
+                              '"plateau_val" monitors val_acc; '
                               'with eval_every>1 the effective patience is inflated, '
                               'so set --eval_every 1 if you want patience to mean epochs.'))
     parser.add_argument('--lr_factor', type=float, default=None,
@@ -634,15 +599,11 @@ def main():
         if args.lr_factor is not None:
             config_args.lr_factor = args.lr_factor
 
-        # Probabilistic virtual nodes
         config_args.prob_vn = bool(args.prob_vn)
         if args.prob_vn:
-            # Ensure the base VN code path is never picked alongside prob_vn.
             config_args.use_virtual_nodes = False
         if args.num_vn is not None:
             config_args.num_vn = args.num_vn
-        if args.vn_per_node is not None:
-            config_args.vn_per_node = args.vn_per_node
         if args.vn_tau_schedule is not None:
             config_args.vn_tau_schedule = args.vn_tau_schedule
         if args.vn_tau_start is not None:
@@ -652,7 +613,6 @@ def main():
         if args.vn_tau_anneal_epochs is not None:
             config_args.vn_tau_anneal_epochs = args.vn_tau_anneal_epochs
         config_args.oracle_routing = bool(args.oracle_routing)
-        config_args.oracle_route_centers = bool(args.oracle_route_centers)
         if args.vn_router is not None:
             config_args.vn_router = args.vn_router
         if args.vn_d_router is not None:
@@ -661,10 +621,6 @@ def main():
             raise ValueError(
                 "--oracle_routing requires --prob_vn; it replaces the learned router "
                 "inside the probabilistic VN model."
-            )
-        if args.oracle_route_centers and not args.oracle_routing:
-            raise ValueError(
-                "--oracle_route_centers requires --oracle_routing."
             )
 
         config_args.target_acc = args.target_acc
