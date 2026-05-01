@@ -7,6 +7,8 @@ from torch_geometric.nn import GCNConv, global_add_pool, global_mean_pool
 from easydict import EasyDict
 from utils import get_layer
 
+#ARC Comment
+
 
 # Mapping for data types
 dtype_mapping = {
